@@ -1,0 +1,620 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel, LongformerSelfAttention, LongformerConfig, LongformerModel
+from torchvision import transforms  # 补充缺失的transforms导入
+import logging
+import math
+
+# Initialize logger for training monitoring and error tracking
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# 1. Mixture of Block Attention (MoBA) Module
+# Corresponding to Section IV.Methodology of the paper
+# Core Function: Enhance FC,attn with block-sparse attention, collaborating with Longformer
+# to process ultra-long code sequences (e.g., Linux kernel code)
+# -----------------------------------------------------------------------------
+class MoBA(nn.Module):
+    def __init__(self, embed_dim=768, num_heads=12, block_size=64, num_blocks=4):
+        """
+        Args:
+            embed_dim: Feature dimension, consistent with CLIP's projection dimension (768) as defined in the paper
+            num_heads: Number of attention heads, aligned with transformer-based model design
+            block_size: Window size for local attention, set to 64 as per paper's optimal configuration
+            num_blocks: Number of parallel block attention layers, enabling multi-scale feature extraction
+        """
+        super(MoBA, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.block_size = block_size
+        self.num_blocks = num_blocks
+
+        # Initialize multiple block attention layers based on Longformer's local window attention
+        # Each block focuses on different local regions of the sequence
+        self.block_attns = nn.ModuleList([
+            LongformerSelfAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                max_positional_embeddings=4096,  # Match Longformer's max sequence length
+                attention_window=block_size,  # Local attention window size
+                attention_dilation=1,  # No dilation for basic local attention
+                is_decoder=False  # Encoder-only architecture for feature extraction
+            ) for _ in range(num_blocks)
+        ])
+
+        # Learnable mixture weights for adaptive fusion of multi-block outputs
+        self.mixture_weights = nn.Parameter(torch.ones(num_blocks) / num_blocks)
+        # Output projection and layer normalization for stable training
+        self.output_proj = nn.Linear(embed_dim, embed_dim)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x, attention_mask=None):
+        """
+        Forward pass of MoBA module
+        Args:
+            x: Input feature tensor with shape [batch_size, seq_len, embed_dim]
+            attention_mask: Attention mask with shape [batch_size, seq_len], 1 for valid tokens, 0 for padding
+        Returns:
+            out: Enhanced feature tensor after multi-block attention fusion, shape [batch_size, seq_len, embed_dim]
+        """
+        batch_size, seq_len, _ = x.shape
+        block_outputs = []
+
+        # Compute output for each block attention layer in parallel
+        for attn in self.block_attns:
+            # LongformerSelfAttention returns (output, attention_weights), we only need the output
+            attn_out = attn(x, attention_mask=attention_mask)[0]
+            block_outputs.append(attn_out)
+
+        # Normalize mixture weights to ensure valid probability distribution
+        normalized_weights = torch.softmax(self.mixture_weights, dim=0)
+        # Adaptive fusion of multi-block outputs using learned weights
+        mixed_out = sum(w * out for w, out in zip(normalized_weights, block_outputs))
+
+        # Residual connection + layer normalization to mitigate vanishing gradient
+        out = self.layer_norm(x + self.output_proj(mixed_out))
+        return out
+
+
+# -----------------------------------------------------------------------------
+# 2. Longformer Text Encoder Module
+# Corresponding to Section IV.Methodology of the paper
+# Core Function: Extract features from ultra-long code sequences (up to 4096 tokens)
+# solving the sequence length limitation of traditional LLMs in handling Linux kernel code
+# -----------------------------------------------------------------------------
+class LongformerTextEncoder(nn.Module):
+    def __init__(self, embed_dim=768, max_seq_len=4096, num_heads=12, num_hidden_layers=6):
+        """
+        Args:
+            embed_dim: Feature dimension, consistent with CLIP's output dimension (768)
+            max_seq_len: Maximum sequence length supported, set to 4096 as per paper
+            num_heads: Number of attention heads for Longformer
+            num_hidden_layers: Number of transformer layers in Longformer
+        """
+        super(LongformerTextEncoder, self).__init__()
+        # Configure Longformer according to the paper's requirements
+        self.config = LongformerConfig(
+            hidden_size=embed_dim,
+            num_attention_heads=num_heads,
+            num_hidden_layers=num_hidden_layers,
+            max_position_embeddings=max_seq_len,
+            attention_window=64,  # Local attention window size, aligned with MoBA's block size
+            attention_dilation=1,
+            is_decoder=False,
+            pad_token_id=0  # Default padding token ID
+        )
+        # Initialize pre-trained Longformer model for text feature extraction
+        self.longformer = LongformerModel(self.config)
+        # Projection layer to align Longformer's output with CLIP's feature dimension
+        self.projection = nn.Linear(embed_dim, embed_dim)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, input_ids, attention_mask):
+        """
+        Forward pass of Longformer text encoder
+        Args:
+            input_ids: Tokenized code sequence, shape [batch_size, seq_len]
+            attention_mask: Attention mask, shape [batch_size, seq_len]
+        Returns:
+            pooled_feature: Pooled sentence-level feature, shape [batch_size, embed_dim]
+        """
+        # Longformer forward pass, output includes hidden states and attention weights
+        longformer_outputs = self.longformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True  # Return all hidden states for feature selection
+        )
+        # Extract the last hidden state as the primary feature (shape: [batch_size, seq_len, embed_dim])
+        last_hidden_state = longformer_outputs.last_hidden_state
+        # Global average pooling to get sentence-level feature (adaptive to variable sequence length)
+        pooled_feature = self.layer_norm(self.projection(last_hidden_state.mean(dim=1)))
+        return pooled_feature
+
+
+# -----------------------------------------------------------------------------
+# 3. Label Encoder Module
+# Corresponding to FY definition in the paper's Notation/Parameter Reference Table
+# Core Function: Convert binary labels (0/1) to feature vectors (1D for basic version, 768D for extended version)
+# -----------------------------------------------------------------------------
+class LabelEncoder(nn.Module):
+    def __init__(self, embed_dim=768, version="basic"):
+        """
+        Args:
+            embed_dim: Target feature dimension for extended version (768)
+            version: "basic" (1D feature) or "extended" (768D feature) as defined in the paper
+        """
+        super(LabelEncoder, self).__init__()
+        self.version = version
+        self.embed_dim = embed_dim
+
+        if version == "extended":
+            # Extended version: Map 1D label to 768D feature for better fusion with FI/FC
+            self.fc = nn.Sequential(
+                nn.Linear(1, embed_dim // 2),
+                nn.ReLU(),  # Non-linear activation for feature enhancement
+                nn.Linear(embed_dim // 2, embed_dim),
+                nn.LayerNorm(embed_dim)  # Stabilize training
+            )
+        else:
+            # Basic version: Directly return 1D feature without transformation
+            self.fc = nn.Identity()
+
+    def forward(self, labels):
+        """
+        Forward pass of label encoder
+        Args:
+            labels: Binary labels (0=UAF vulnerability, 1=no UAF vulnerability), shape [batch_size]
+        Returns:
+            encoded_labels: Encoded label features, shape [batch_size, 1] (basic) or [batch_size, 768] (extended)
+        """
+        # Reshape labels from [batch_size] to [batch_size, 1] before encoding
+        return self.fc(labels.float().unsqueeze(1))
+
+
+# -----------------------------------------------------------------------------
+# 4. UAF Dataset Module
+# Corresponding to the three inputs (C, I, Y) in Section III.OVERVIEW of the paper
+# Core Function: Load and preprocess code, static analysis images, and labels
+# -----------------------------------------------------------------------------
+class UAFDataset(Dataset):
+    def __init__(self, img_root, meta_root, genchange_root, is_train, preprocess, clip_processor,
+                 longformer_max_len=4096):
+        """
+        Args:
+            img_root: Root directory of static analysis images (I in the paper)
+            meta_root: Root directory of dataset split files (train.txt/val.txt)
+            genchange_root: Root directory of source code files (C in the paper)
+            is_train: Boolean flag for training/validation set
+            preprocess: Image preprocessing pipeline
+            clip_processor: CLIP processor for text tokenization
+            longformer_max_len: Maximum sequence length for Longformer (4096 as per paper)
+        """
+        logger.info(f"Initializing UAFDataset (Longformer max length: {longformer_max_len})...")
+        self.img_root = img_root
+        self.meta_root = meta_root
+        self.genchange_root = genchange_root
+        # Determine dataset split file (train/val)
+        self.read_file = os.path.join(meta_root, 'train.txt') if is_train else os.path.join(meta_root, 'val.txt')
+        self.is_train = is_train
+        self.img_process = preprocess
+        self.longformer_max_len = longformer_max_len
+        self.clip_processor = clip_processor
+
+        # Initialize lists to store sample paths and labels
+        self.img_paths = []
+        self.code_paths = []
+        self.labels = []  # 0=UAF vulnerability, 1=no UAF vulnerability (paper's Y definition)
+
+        # Check if dataset split file exists
+        if not os.path.exists(self.read_file):
+            raise FileNotFoundError(f"Dataset split file not found: {self.read_file}")
+
+        # Load sample information from split file
+        with open(self.read_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) < 2:
+                    logger.warning(f"Skipping invalid line: {line.strip()}")
+                    continue
+                img_name, label_flag = parts[0].strip(), parts[1].strip()
+
+                # Map to paper's binary label definition: -0- is dataset-specific UAF sample naming convention
+                label = 0 if (label_flag == 'uaf' or '-0-' in img_name) else 1
+                # Construct image path (separated by UAF/non-UAF)
+                img_path = os.path.join(self.img_root, 'uaf' if label == 0 else 'not_uaf', img_name)
+                # Construct source code path (replace image extension with .c)
+                code_path = os.path.join(self.genchange_root, img_name.replace('.jpg', '.c'))
+
+                # Verify file existence before adding to dataset
+                if os.path.exists(img_path) and os.path.exists(code_path):
+                    self.img_paths.append(img_path)
+                    self.code_paths.append(code_path)
+                    self.labels.append(label)
+                else:
+                    missing_files = []
+                    if not os.path.exists(img_path):
+                        missing_files.append(f"image ({img_path})")
+                    if not os.path.exists(code_path):
+                        missing_files.append(f"code ({code_path})")
+                    logger.warning(f"Missing {', '.join(missing_files)} for sample: {img_name}")
+
+        # Check if dataset is empty
+        if not self.img_paths:
+            raise ValueError("No valid samples found. Please check dataset structure and file paths.")
+
+        # Log dataset statistics
+        uaf_count = sum(1 for l in self.labels if l == 0)
+        non_uaf_count = len(self.labels) - uaf_count
+        logger.info(
+            f"Dataset initialized successfully: Total samples={len(self)}, UAF samples={uaf_count}, Non-UAF samples={non_uaf_count}")
+
+    def __len__(self):
+        """Return total number of samples in the dataset"""
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        """
+        Get single sample by index
+        Returns:
+            image: Preprocessed static analysis image (I), shape [3, 224, 224]
+            input_ids: Tokenized source code (C), shape [longformer_max_len]
+            attention_mask: Attention mask for code tokens, shape [longformer_max_len]
+            label: Binary label (Y), shape []
+        """
+        # Load and preprocess static analysis image
+        img_path = self.img_paths[idx]
+        try:
+            image = Image.open(img_path).convert('RGB')  # Convert to RGB format
+            image = self.img_process(image)  # Apply preprocessing pipeline
+        except Exception as e:
+            logger.error(f"Failed to load image {img_path}: {str(e)}")
+            raise e
+
+        # Load and tokenize source code
+        code_path = self.code_paths[idx]
+        try:
+            with open(code_path, 'r') as f:
+                code_text = f.read()  # Read raw source code
+        except Exception as e:
+            logger.error(f"Failed to load code {code_path}: {str(e)}")
+            raise e
+
+        # Tokenize code using CLIP processor (align with Longformer's input format)
+        tokenized_code = self.clip_processor(
+            text=code_text,
+            max_length=self.longformer_max_len,
+            truncation=True,  # Truncate if code exceeds max length
+            padding='max_length',  # Pad to max length if code is shorter
+            return_tensors="pt"  # Return PyTorch tensors
+        )
+        input_ids = tokenized_code['input_ids'].squeeze(0)  # Remove batch dimension
+        attention_mask = tokenized_code['attention_mask'].squeeze(0)  # Attention mask for valid tokens
+
+        # Get binary label
+        label = self.labels[idx]
+
+        return image, input_ids, attention_mask, label
+
+
+# -----------------------------------------------------------------------------
+# 5. Main VLM Model (UAFVLM)
+# Corresponding to Figure 1 and Mathematical Equations in the paper
+# Core Function: Implement two-step fusion logic (Label+Image → Intermediate → Attended Text)
+# Integrate CLIP + MoBA + Longformer for UAF vulnerability detection
+# -----------------------------------------------------------------------------
+class UAFVLM(nn.Module):
+    def __init__(self, clip_model, embed_dim=768, label_encoder_version="basic"):
+        """
+        Args:
+            clip_model: Pre-trained CLIP model for image/text feature extraction
+            embed_dim: Feature dimension (768, consistent with CLIP's projection dimension)
+            label_encoder_version: "basic" or "extended" for FY feature
+        """
+        super(UAFVLM, self).__init__()
+        self.clip_model = clip_model
+        self.embed_dim = embed_dim
+        self.label_encoder_version = label_encoder_version
+
+        # Initialize core components as defined in the paper
+        self.label_encoder = LabelEncoder(embed_dim=embed_dim, version=label_encoder_version)  # Generate FY
+        self.longformer_encoder = LongformerTextEncoder(embed_dim=embed_dim, max_seq_len=4096)  # Generate FC_longformer
+        self.moba = MoBA(embed_dim=embed_dim, num_heads=12, block_size=64)  # Enhance FC to FC,attn
+        self.classifier = self._init_classifier()  # Linear classification layer (W and b in the paper)
+
+        # Freeze CLIP's base encoder to retain pre-trained knowledge (only fine-tune downstream modules)
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+
+    def _init_classifier(self):
+        """
+        Initialize linear classification layer with dimension matching Fcombined (paper's Step 3)
+        Returns:
+            nn.Linear: Classification layer with correct input dimension
+        """
+        if self.label_encoder_version == "basic":
+            # Basic version: Fconcat1 = FY(1D) + FI(768D) = 769D; Fcombined = 769D + FC_attn(768D) = 1537D
+            return nn.Linear(769 + 768, 2)
+        else:
+            # Extended version: Fconcat1 = FY(768D) + FI(768D) = 1536D; Fcombined = 1536D + FC_attn(768D) = 2304D
+            return nn.Linear(1536 + 768, 2)
+
+    def forward(self, image, input_ids, attention_mask, labels):
+        """
+        Forward pass of the main model, strictly following the paper's mathematical equations
+        Args:
+            image: Preprocessed static analysis image (I), shape [batch_size, 3, 224, 224]
+            input_ids: Tokenized code (C), shape [batch_size, 4096]
+            attention_mask: Code attention mask, shape [batch_size, 4096]
+            labels: Binary labels (Y), shape [batch_size]
+        Returns:
+            Z: Raw logits (paper's Step 3), shape [batch_size, 2]
+        """
+        # Step 1: Extract core features (FI, FY, FC, FC_longformer)
+        ###########################################################################
+        # FI: Visual feature from static analysis images (paper's definition)
+        # Output of CLIP's Image Encoder, shape [batch_size, 768]
+        ###########################################################################
+        FI = self.clip_model.get_image_features(pixel_values=image)
+
+        ###########################################################################
+        # FY: Label feature (basic: [batch_size, 1]; extended: [batch_size, 768])
+        # Output of LabelEncoder, aligned with paper's FY definition
+        ###########################################################################
+        FY = self.label_encoder(labels)
+
+        ###########################################################################
+        # FC: Raw text feature from code (paper's definition)
+        # Output of CLIP's Text Encoder, shape [batch_size, 768]
+        ###########################################################################
+        FC_clip = self.clip_model.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
+
+        ###########################################################################
+        # FC_longformer: Ultra-long code feature from Longformer
+        # Addresses the paper's challenge of processing long Linux kernel code
+        # Shape [batch_size, 768]
+        ###########################################################################
+        FC_longformer = self.longformer_encoder(input_ids=input_ids, attention_mask=attention_mask)
+
+        ###########################################################################
+        # FC_attn: Attended text feature (paper's FC,attn)
+        # Fused CLIP+Longformer features enhanced by MoBA
+        # Shape [batch_size, 768]
+        ###########################################################################
+        # Reshape features to [batch_size, 2, 768] for sequence-level MoBA processing
+        FC_combined_seq = torch.cat([FC_clip.unsqueeze(1), FC_longformer.unsqueeze(1)], dim=1)
+        # Apply MoBA to enhance feature representation (attention_mask expanded to [batch_size, 2])
+        FC_attn_seq = self.moba(FC_combined_seq, attention_mask=attention_mask.unsqueeze(1).repeat(1, 2, 1))
+        # Average pooling to get final FC,attn
+        FC_attn = FC_attn_seq.mean(dim=1)
+
+        # Step 2: Two-step feature fusion (strictly following Figure 1 of the paper)
+        ###########################################################################
+        # First Fusion: Label + Image → Fconcat1 (paper's Step 1)
+        ###########################################################################
+        Fconcat1 = torch.cat([FY, FI], dim=1)
+
+        ###########################################################################
+        # Second Fusion: Intermediate + Attended Text → Fcombined (paper's Step 2)
+        ###########################################################################
+        Fcombined = torch.cat([Fconcat1, FC_attn], dim=1)
+
+        # Step 3: Linear classification (paper's Step 3: Z = W·Fcombined + b)
+        ###########################################################################
+        # Map Fcombined to logits Z (shape [batch_size, 2] for binary classification)
+        ###########################################################################
+        Z = self.classifier(Fcombined)
+
+        return Z  # Logits will be converted to probabilities via Softmax in loss function
+
+
+# -----------------------------------------------------------------------------
+# 6. Training Function
+# Corresponding to the paper's Cross-Entropy Loss optimization objective
+# Core Function: Train the model with standard deep learning pipeline
+# -----------------------------------------------------------------------------
+def train_model(model, dataloader, optimizer, criterion, device, num_epochs=10, save_dir='./models'):
+    """
+    Args:
+        model: UAFVLM model instance
+        dataloader: Training DataLoader
+        optimizer: Optimizer (AdamW as recommended for transformer models)
+        criterion: Loss function (CrossEntropyLoss with built-in Softmax)
+        device: Training device (GPU recommended for Longformer)
+        num_epochs: Number of training epochs
+        save_dir: Directory to save trained models
+    """
+    # Create save directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    logger.info(f"Starting training on {device} (num_epochs={num_epochs})...")
+
+    # Set model to training mode
+    model.train()
+
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+
+        # Iterate over training batches
+        for batch_idx, (images, input_ids, attention_masks, labels) in enumerate(dataloader):
+            # Move data to target device
+            images = images.to(device, non_blocking=True)
+            input_ids = input_ids.to(device, non_blocking=True)
+            attention_masks = attention_masks.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            # Forward pass: Get logits Z
+            optimizer.zero_grad()  # Reset gradient to avoid accumulation
+            logits = model(images, input_ids, attention_masks, labels)
+
+            # Calculate loss (CrossEntropyLoss includes Softmax, paper's Step 4)
+            loss = criterion(logits, labels)
+
+            # Backward pass: Compute gradients
+            loss.backward()
+            # Gradient clipping to prevent exploding gradient (max_norm=1.0 as per paper)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Update model parameters
+            optimizer.step()
+
+            # Accumulate training metrics
+            total_loss += loss.item()
+            # Convert logits to predictions (argmax over class dimension)
+            preds = torch.argmax(logits, dim=1)
+            total_correct += (preds == labels).sum().item()
+            total_samples += labels.size(0)
+
+            # Log progress every 10 batches
+            if (batch_idx + 1) % 10 == 0:
+                avg_loss = total_loss / (batch_idx + 1)
+                accuracy = total_correct / total_samples
+                logger.info(
+                    f"Epoch [{epoch + 1}/{num_epochs}], Batch [{batch_idx + 1}/{len(dataloader)}], "
+                    f"Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}"
+                )
+
+        # Log epoch-level metrics
+        avg_epoch_loss = total_loss / len(dataloader)
+        epoch_accuracy = total_correct / total_samples
+        logger.info(
+            f"Epoch [{epoch + 1}/{num_epochs}] Completed - Avg Loss: {avg_epoch_loss:.4f}, "
+            f"Avg Accuracy: {epoch_accuracy:.4f}"
+        )
+
+        # Save model checkpoint after each epoch
+        checkpoint_path = os.path.join(save_dir, f'uaf_vlm_moba_longformer_epoch_{epoch + 1}.pth')
+        torch.save(model.state_dict(), checkpoint_path)
+        logger.info(f"Model checkpoint saved to: {checkpoint_path}")
+
+
+# -----------------------------------------------------------------------------
+# 7. Main Execution
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # -------------------------- Configuration --------------------------
+    # Dataset paths (modify according to your local environment)
+    img_root = '/zhangliqiang/clip/copyfolder/vlm0/pdg_data/images'
+    meta_root = '/zhangliqiang/clip/copyfolder/vlm0/pdg_data/meta'
+    genchange_root = '/zhangliqiang/clip/copyfolder/vlm0/genchangename'
+    save_dir = './uaf_vlm_moba_longformer_models'  # Directory to save checkpoints
+
+    # Training parameters (strictly aligned with paper's specifications)
+    batch_size = 2  # Optimized for 4096-token ultra-long sequences
+    num_epochs = 10
+    learning_rate = 1e-4  # Optimal learning rate for fine-tuning
+    label_encoder_version = "basic"  # Choose "basic" or "extended"
+
+    # -------------------------- Device Initialization --------------------------
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        logger.warning("WARNING: Training on CPU is not recommended for Longformer. Training will be extremely slow.")
+    logger.info(f"Using device: {device} (CUDA available: {torch.cuda.is_available()})")
+
+    # -------------------------- Load CLIP Model --------------------------
+    try:
+        # 优先加载本地模型（论文使用的预训练CLIP）
+        clip_model = CLIPModel.from_pretrained('/zhangliqiang/clip/copyfolder/vlm0/clip-model').to(device)
+        clip_processor = CLIPProcessor.from_pretrained('/zhangliqiang/clip/copyfolder/vlm0/clip-model')
+        logger.info("Loaded local CLIP model successfully.")
+    except Exception as e:
+        # 本地无模型时在线加载（提升代码可复现性）
+        logger.warning(f"Local CLIP model load failed: {str(e)}. Trying to load online model...")
+        clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+        clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        logger.info("Loaded online CLIP model (openai/clip-vit-base-patch32) successfully.")
+
+    # -------------------------- Initialize Dataset --------------------------
+    # Image preprocessing pipeline (matches CLIP's input requirements)
+    image_transform = transforms.Compose([
+        transforms.Resize((224, 224)),  # Resize to CLIP's input size
+        transforms.ToTensor(),  # Convert to tensor
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],  # CLIP's mean
+            std=[0.26862954, 0.26130258, 0.27577711]  # CLIP's std
+        )
+    ])
+
+    # Create training dataset
+    try:
+        train_dataset = UAFDataset(
+            img_root=img_root,
+            meta_root=meta_root,
+            genchange_root=genchange_root,
+            is_train=True,
+            preprocess=image_transform,
+            clip_processor=clip_processor,
+            longformer_max_len=4096
+        )
+        # Create DataLoader with shuffle
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True  # Speed up data transfer to GPU
+        )
+        logger.info(f"Training DataLoader created: {len(train_dataloader)} batches per epoch")
+    except Exception as e:
+        logger.error(f"Failed to create dataset/dataloader: {str(e)}")
+        raise e
+
+    # -------------------------- Initialize Model --------------------------
+    try:
+        model = UAFVLM(
+            clip_model=clip_model,
+            embed_dim=768,
+            label_encoder_version=label_encoder_version
+        ).to(device)
+        logger.info("UAFVLM model (MoBA + Longformer) initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize UAFVLM model: {str(e)}")
+        raise e
+
+    # -------------------------- Load Pretrained Weights (Optional) --------------------------
+    checkpoint_path = '/zhangliqiang/clip/copyfolder/vlm0/models/uaf_model_epoch_5.pth'
+    if os.path.exists(checkpoint_path):
+        try:
+            # Load checkpoint and filter mismatched weights (MoBA/Longformer are new modules)
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model_dict = model.state_dict()
+            # Only load weights with matching names and shapes
+            matched_weights = {k: v for k, v in checkpoint.items() if
+                               k in model_dict and v.shape == model_dict[k].shape}
+            model_dict.update(matched_weights)
+            model.load_state_dict(model_dict, strict=False)
+            logger.info(f"Loaded matched pretrained weights from: {checkpoint_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load pretrained weights: {str(e)}. Training from scratch.")
+
+    # -------------------------- Initialize Optimizer and Criterion --------------------------
+    # Loss function: CrossEntropyLoss (includes Softmax, paper's Step 4 and 5)
+    criterion = nn.CrossEntropyLoss()
+    # Optimizer: AdamW with weight decay (paper's configuration: weight_decay=1e-5)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=1e-5  # L2 regularization to prevent overfitting
+    )
+    logger.info("Optimizer and criterion initialized successfully.")
+
+    # -------------------------- Start Training --------------------------
+    try:
+        train_model(
+            model=model,
+            dataloader=train_dataloader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            num_epochs=num_epochs,
+            save_dir=save_dir
+        )
+        logger.info("Training completed successfully!")
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}")
+        raise e
