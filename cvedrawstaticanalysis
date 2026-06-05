@@ -1,0 +1,420 @@
+#adding additional functions with delete recognition as a part of free operation and enhanced identifications of
+#the varargs uaf 
+import re
+import matplotlib.pyplot as plt
+import os
+from matplotlib.patches import Rectangle, Polygon, Ellipse, Patch
+
+# Disable GUI popup, save figure only
+plt.switch_backend('Agg')
+
+# ===================== Global Configuration =====================
+unwanted_keywords = [
+    'int', 'char', 'float', 'double', 'void', 'long', 'short', 'unsigned', 'signed',
+    'size_t', 'NULL', 'malloc', 'sizeof', 'exit', 'label', 'endif', 'ifndef', 'define',
+    'ifdef', 'include', 'return', 'else', 'static', 'for', 'while', 'if', 'switch',
+    'case', 'break', 'continue', 'default', 'goto', 'new', 'delete', 'const', 'enum',
+    'volatile', 'extern', 'inline', 'virtual', 'this', 'try', 'catch', 'wchar_t',
+    'va_list', 'va_start', 'va_arg', 'va_end'  # Add VarArgs macros to blacklist
+]
+
+# Predefined standard variable-argument functions (extend as needed)
+VARARGS_FUNCTIONS = {
+    'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 'vsprintf', 'vsnprintf',
+    'scanf', 'fscanf', 'sscanf', 'vscanf', 'vfscanf', 'vsscanf',
+    'syslog', 'vsyslog', 'err', 'verr', 'warn', 'vwarn',
+    'sqlite3_printf', 'sqlite3_vprintf'  # Project-specific customized functions
+}
+
+
+# ===================== Original Utility Functions (Unmodified Logic) =====================
+def filter_comments(text):
+    """Strip C-style block comments and line comments from source code"""
+    pattern = r"/\*.*?\*/|//.*?$"
+    return re.sub(pattern, "", text, flags=re.DOTALL | re.MULTILINE)
+
+
+def split_c_code_by_semicolon_and_braces(code):
+    """Split C source into individual statements by ; { } delimiters"""
+    preprocessor_statements = re.split(r'(\#include\s*<.*?>)', code)
+    combined_statements = []
+    for part in preprocessor_statements:
+        if not part.strip():
+            continue
+        if re.match(r'\#include\s*<.*?>', part):
+            combined_statements.append(part.strip())
+        else:
+            statements = re.split(r'([;{}])', part)
+            current_statement = ""
+            for stmt in statements:
+                current_statement += stmt.strip()
+                if stmt in ';{}':
+                    if current_statement.strip():
+                        combined_statements.append(current_statement.strip())
+                    current_statement = ""
+            if current_statement.strip():
+                combined_statements.append(current_statement.strip())
+    return combined_statements
+
+
+def analyze_free_statement(statement):
+    """Parse free() / C++ delete memory release operations"""
+    free_pattern = r'free\s*\(\s*(\w+)\s*\);?'
+    free_match = re.search(free_pattern, statement)
+    if free_match:
+        return f"free {free_match.group(1)}"
+    delete_pattern = r'delete\s*(?:\[\s*\])?\s*(\w+)\s*;?'
+    delete_match = re.search(delete_pattern, statement)
+    if delete_match:
+        return f"free {delete_match.group(1)}"
+    return None
+
+
+def extract_malloc_calls(code_string):
+    """Detect heap memory allocation via malloc / sqlite3DbMallocRawNN"""
+    malloc_pattern = r'(\w+)\s*=\s*\(.*?\)\s*(malloc|sqlite3DbMallocRawNN)\s*\('
+    matches = re.findall(malloc_pattern, code_string, re.DOTALL)
+    processes = []
+    variables = []
+    for var_name, _ in matches:
+        processes.append("malloc")
+        variables.append(var_name.strip())
+    return processes, variables
+
+
+def extract_use_features(code):
+    """Extract variable reference/usage features for memory access tracking"""
+    use_features = []
+    variable_id_map = {}
+    next_id = 1
+    use_patterns = [
+        r'([a-zA-Z_]\w*)\s*=\s*.+;',
+        r'\w+\s*\(\s*&?([a-zA-Z_]\w*)\s*\);',
+        r'([a-zA-Z_]\w*)\s*\[\s*.+\s*\]',
+        r'->([a-zA-Z_]\w*)',
+        r'\.([a-zA-Z_]\w*)'
+    ]
+    for line_num, line in enumerate(code.splitlines(), 1):
+        stripped_line = line.strip()
+        if not stripped_line or stripped_line.startswith(('#', '//')):
+            continue
+        for pattern in use_patterns:
+            matches = re.findall(pattern, stripped_line)
+            for var_name in matches:
+                if var_name and var_name not in unwanted_keywords:
+                    if var_name not in variable_id_map:
+                        variable_id_map[var_name] = f"data{next_id}"
+                        next_id += 1
+                    use_features.append(f"use {variable_id_map[var_name]}")
+    return use_features
+
+
+def track_pointer_aliases(statement):
+    """Detect pointer alias assignments, exclude self-assignment cases"""
+    pointer_alias_pattern = r'(\*?[a-zA-Z_]\w*)\s*=\s*(\*?[a-zA-Z_]\w*)\s*;'
+    ref_alias_pattern = r'([a-zA-Z_]\w*)\s*=\s*&\s*([a-zA-Z_]\w*)\s*;'
+    alias_match = re.search(pointer_alias_pattern, statement)
+    if not alias_match:
+        alias_match = re.search(ref_alias_pattern, statement)
+    if alias_match:
+        dest_ptr, src_ptr = alias_match.group(1), alias_match.group(2)
+        if (dest_ptr not in unwanted_keywords and
+                src_ptr not in unwanted_keywords and
+                not dest_ptr.isdigit() and
+                not src_ptr.isdigit() and
+                dest_ptr != src_ptr):
+            return f"alias {src_ptr} -> {dest_ptr}"
+    return None
+
+
+def extract_data_copy_features(code):
+    """Extract value copy and pointer alias operations, skip numeric literal assignment"""
+    copy_alias_features = []
+    for line_num, line in enumerate(code.splitlines(), 1):
+        stripped_line = line.strip()
+        if not stripped_line:
+            continue
+        alias_str = track_pointer_aliases(stripped_line)
+        if alias_str:
+            copy_alias_features.append(alias_str)
+            continue
+        copy_patterns = [
+            r'(\w+)\s*=\s*(\w+)\s*;',
+            r'\*(\w+)\s*=\s*\*(\w+)\s*;'
+        ]
+        for pattern in copy_patterns:
+            matches = re.findall(pattern, stripped_line)
+            for match in matches:
+                if len(match) == 2:
+                    dest_var, src_var = match[0], match[1]
+                    if (dest_var not in unwanted_keywords and
+                            src_var not in unwanted_keywords and
+                            not dest_var.isdigit() and
+                            not src_var.isdigit()):
+                        copy_alias_features.append(f"copy {src_var} -> {dest_var}")
+    return copy_alias_features
+
+
+# ===================== New: VarArgs Macro & Call Parsing Functions =====================
+def extract_vastart(statement):
+    """Extract va_start macro invocation node from source line"""
+    # Match standard va_start(ap, last_fixed_param) syntax
+    vastart_pattern = r'va_start\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*;'
+    match = re.search(vastart_pattern, statement)
+    if match:
+        ap_var = match.group(1)
+        last_param = match.group(2)
+        return f"vastart {ap_var} {last_param}"
+    return None
+
+
+def extract_vaarg(statement):
+    """Extract va_arg macro access node for variable argument fetching"""
+    # Match va_arg(ap, type), supports complex pointer/struct type specifiers
+    vaarg_pattern = r'va_arg\s*\(\s*(\w+)\s*,\s*([^)]+)\s*\)\s*'
+    match = re.search(vaarg_pattern, statement)
+    if match:
+        ap_var = match.group(1)
+        arg_type = match.group(2).strip()
+        # Simplify type name to trailing identifier only for diagram display
+        simple_type = re.sub(r'.*?(\w+)\s*\*?$', r'\1', arg_type)
+        return f"vaarg {ap_var} {simple_type}"
+    return None
+
+
+def extract_varargs_calls(statement):
+    """Identify invocations of predefined variable-argument library functions"""
+    # Iterate pre-defined vararg function set to match function call sites
+    for func_name in VARARGS_FUNCTIONS:
+        escaped_func = re.escape(func_name)
+        pattern = rf'\b{escaped_func}\s*\('
+        if re.search(pattern, statement):
+            return f"varargs {func_name}"
+    return None
+
+
+# ===================== Revised Plot Function (VarArgs Nodes Added) =====================
+def draw_graph(used_varlist):
+    """Render memory operation sequence graph with newly added VarArgs category nodes"""
+    max_draw = 20
+    ops = used_varlist[:max_draw]
+
+    plt.figure(figsize=(18, 9))  # Wider canvas to fit extra node categories
+    ax = plt.gca()
+    ax.set_xlim(-1, len(ops) * 2.2)
+    ax.set_ylim(-2.5, 2.5)  # Higher vertical margin for bottom legend
+    ax.axis('off')
+
+    variable_id_map = {}
+    next_var_id = 1
+
+    # Unified shape dimension constants
+    base_h = 1.0
+    rect_w = 0.85
+    ellipse_w = 0.5
+    tri_w = 0.65
+    trap_w = 0.7
+    poly_w = 0.7  # General polygon sizing for vararg shapes
+
+    for idx, op in enumerate(ops):
+        x_pos = idx * 2.2
+        y_pos = 0
+
+        # Legacy memory operation node rendering (original implementation preserved)
+        if op.startswith("malloc"):
+            var_name = op.split()[1]
+            if var_name not in variable_id_map:
+                variable_id_map[var_name] = next_var_id
+                next_var_id += 1
+            var_id = variable_id_map[var_name]
+            ellipse = Ellipse((x_pos, y_pos), width=ellipse_w, height=base_h,
+                              facecolor='lightcoral', edgecolor='black')
+            ax.add_patch(ellipse)
+            ax.text(x_pos, y_pos, f"{var_id}", ha='center', va='center', fontsize=14, weight='bold')
+
+        elif op.startswith("use"):
+            data_id = op.split()[1]
+            if data_id not in variable_id_map:
+                variable_id_map[data_id] = next_var_id
+                next_var_id += 1
+            var_id = variable_id_map[data_id]
+            rect = Rectangle((x_pos - rect_w / 2, y_pos - base_h / 2),
+                             width=rect_w, height=base_h,
+                             facecolor='lightblue', edgecolor='black')
+            ax.add_patch(rect)
+            ax.text(x_pos, y_pos, f"{var_id}", ha='center', va='center', fontsize=14, weight='bold')
+
+        elif op.startswith("free"):
+            var_name = op.split()[1]
+            if var_name not in variable_id_map:
+                variable_id_map[var_name] = next_var_id
+                next_var_id += 1
+            var_id = variable_id_map[var_name]
+            tri_pts = [
+                (x_pos - tri_w / 2, y_pos - base_h / 2),
+                (x_pos + tri_w / 2, y_pos - base_h / 2),
+                (x_pos, y_pos + base_h / 2)
+            ]
+            triangle = Polygon(tri_pts, facecolor='lightgreen', edgecolor='black')
+            ax.add_patch(triangle)
+            ax.text(x_pos, y_pos, f"{var_id}", ha='center', va='center', fontsize=14, weight='bold')
+
+        elif op.startswith("copy") or op.startswith("alias"):
+            copy_match = re.search(r'(copy|alias)\s+([-_\w>]+)\s+->\s+([-_\w>]+)', op)
+            if copy_match:
+                op_type = copy_match.group(1)
+                src = copy_match.group(2)
+                dest = copy_match.group(3)
+                for var in [src, dest]:
+                    if var not in variable_id_map:
+                        variable_id_map[var] = next_var_id
+                        next_var_id += 1
+                src_id = variable_id_map[src]
+                dest_id = variable_id_map[dest]
+                trap_pts = [
+                    (x_pos - trap_w / 2, y_pos - base_h / 2),
+                    (x_pos + trap_w / 2, y_pos - base_h / 2),
+                    (x_pos + trap_w / 4, y_pos + base_h / 2),
+                    (x_pos - trap_w / 4, y_pos + base_h / 2)
+                ]
+                fill_color = 'lightyellow' if op_type == 'copy' else 'ivory'
+                trapezoid = Polygon(trap_pts, facecolor=fill_color, edgecolor='black')
+                ax.add_patch(trapezoid)
+                ax.text(x_pos, y_pos, f"{src_id}→{dest_id}", ha='center', va='center', fontsize=12, weight='bold')
+
+        # ===================== New VarArgs Shape Render Rules =====================
+        elif op.startswith("vastart"):
+            # va_start: Diamond shape with lavender fill
+            parts = op.split()
+            ap_var = parts[1]
+            if ap_var not in variable_id_map:
+                variable_id_map[ap_var] = next_var_id
+                next_var_id += 1
+            ap_id = variable_id_map[ap_var]
+            diamond_pts = [
+                (x_pos, y_pos + base_h / 2),
+                (x_pos + poly_w / 2, y_pos),
+                (x_pos, y_pos - base_h / 2),
+                (x_pos - poly_w / 2, y_pos)
+            ]
+            diamond = Polygon(diamond_pts, facecolor='lavender', edgecolor='black')
+            ax.add_patch(diamond)
+            ax.text(x_pos, y_pos, f"VS:{ap_id}", ha='center', va='center', fontsize=12, weight='bold')
+
+        elif op.startswith("vaarg"):
+            # va_arg: Octagon shape with thistle fill
+            parts = op.split()
+            ap_var = parts[1]
+            arg_type = parts[2]
+            if ap_var not in variable_id_map:
+                variable_id_map[ap_var] = next_var_id
+                next_var_id += 1
+            ap_id = variable_id_map[ap_var]
+            oct_pts = []
+            for i in range(8):
+                angle = i * 45 * 3.14159 / 180
+                oct_pts.append((
+                    x_pos + poly_w / 2 * 0.7 * math.cos(angle),
+                    y_pos + base_h / 2 * 0.7 * math.sin(angle)
+                ))
+            octagon = Polygon(oct_pts, facecolor='thistle', edgecolor='black')
+            ax.add_patch(octagon)
+            ax.text(x_pos, y_pos, f"VA:{ap_id}\n{arg_type}", ha='center', va='center', fontsize=10, weight='bold')
+
+        elif op.startswith("varargs"):
+            # VarArgs function call: Pentagon shape with lightpink fill
+            func_name = op.split()[1]
+            pent_pts = []
+            for i in range(5):
+                angle = (i * 72 - 90) * 3.14159 / 180  # Pentagon apex pointing upward
+                pent_pts.append((
+                    x_pos + poly_w / 2 * math.cos(angle),
+                    y_pos + base_h / 2 * math.sin(angle)
+                ))
+            pentagon = Polygon(pent_pts, facecolor='lightpink', edgecolor='black')
+            ax.add_patch(pentagon)
+            ax.text(x_pos, y_pos, f"VC\n{func_name[:6]}", ha='center', va='center', fontsize=10, weight='bold')
+
+        # Bottom sequential step label
+        ax.text(x_pos, -1.8, f"Step{idx + 1}", ha="center", fontsize=8, color="gray")
+
+    # Updated legend containing vararg node definitions
+    legend_elements = [
+        Patch(facecolor='lightcoral', edgecolor='black', label='Memory Allocation (malloc)'),
+        Patch(facecolor='lightblue', edgecolor='black', label='Memory Usage'),
+        Patch(facecolor='lightgreen', edgecolor='black', label='Memory Free'),
+        Patch(facecolor='lightyellow', edgecolor='black', label='Data Copy'),
+        Patch(facecolor='ivory', edgecolor='black', label='Pointer Alias'),
+        Patch(facecolor='lavender', edgecolor='black', label='va_start (VS)'),
+        Patch(facecolor='thistle', edgecolor='black', label='va_arg (VA)'),
+        Patch(facecolor='lightpink', edgecolor='black', label='VarArgs Call (VC)')
+    ]
+    ax.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=4, fontsize=10)
+    plt.title("UAF Static Analysis Visual Feature Diagram (with VarArgs Support)", fontsize=14, weight="bold")
+    plt.tight_layout()
+    plt.savefig("static_varargs.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print("\n✅ static_varargs.png saved successfully")
+
+
+# ===================== Revised Main Entry (VarArgs Parsing Pipeline Attached) =====================
+def main():
+    file_path = r"D:\zhang\uaf\cppsnippetcve.txt"
+    if not os.path.exists(file_path):
+        print("Error: Target source file not found ->", file_path)
+        return
+
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+        raw_code = file.read()
+
+    filtered_code = filter_comments(raw_code)
+    statements = split_c_code_by_semicolon_and_braces(filtered_code)
+
+    used_varlist = []
+    for stmt in statements:
+        if not stmt:
+            continue
+        # Original analysis pipeline execution order preserved
+        malloc_processes, malloc_vars = extract_malloc_calls(stmt)
+        for proc, var in zip(malloc_processes, malloc_vars):
+            used_varlist.append(f"{proc} {var}")
+
+        free_op = analyze_free_statement(stmt)
+        if free_op:
+            used_varlist.append(free_op)
+
+        use_features = extract_use_features(stmt)
+        used_varlist.extend(use_features)
+
+        copy_alias_features = extract_data_copy_features(stmt)
+        used_varlist.extend(copy_alias_features)
+
+        # Append new VarArgs parsing logic
+        vastart_op = extract_vastart(stmt)
+        if vastart_op:
+            used_varlist.append(vastart_op)
+
+        vaarg_op = extract_vaarg(stmt)
+        if vaarg_op:
+            used_varlist.append(vaarg_op)
+
+        varargs_call_op = extract_varargs_calls(stmt)
+        if varargs_call_op:
+            used_varlist.append(varargs_call_op)
+
+    # Print parsed operation sequence to console
+    print("==== Extracted UAF Operation Sequence (with VarArgs) ====")
+    for idx, item in enumerate(used_varlist, 1):
+        print(f"{idx}. {item}")
+
+    # Generate visualization graph if valid operations exist
+    if used_varlist:
+        draw_graph(used_varlist)
+    else:
+        print("\nNo valid memory-related operations detected")
+
+
+if __name__ == "__main__":
+    import math  # Import math module for polygon vertex coordinate calculation
+
+    main()
