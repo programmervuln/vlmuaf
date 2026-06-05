@@ -1,0 +1,795 @@
+# addressing varargs and type cast especially
+import re
+import matplotlib.pyplot as plt
+import os
+from matplotlib.patches import Rectangle, Polygon, Circle, Trapezoid
+
+
+def split_c_code_by_semicolon_and_braces(code):
+    """
+    Split C code by semicolons, curly braces, and preserve #include statements.
+    Returns a list of independent code statements.
+    """
+    # Split preprocessor statements (#include) while preserving them
+    preprocessor_statements = re.split(r'(\#include\s*<.*?>)', code)
+
+    combined_statements = []
+    for part in preprocessor_statements:
+        if not part.strip():
+            continue
+
+        if re.match(r'\#include\s*<.*?>', part):  # Preserve #include statements
+            combined_statements.append(part.strip())
+        else:
+            # Split remaining code by ;, {, } while preserving delimiters
+            statements = re.split(r'([;{}])', part)
+            current_statement = ""
+            for stmt in statements:
+                current_statement += stmt.strip()
+                if stmt in ';{}':  # Finalize statement at delimiters
+                    if current_statement.strip():
+                        combined_statements.append(current_statement.strip())
+                    current_statement = ""
+
+            # Add remaining content if any
+            if current_statement.strip():
+                combined_statements.append(current_statement.strip())
+
+    return combined_statements
+
+
+def filter_comments(text):
+    """
+    Remove C-style comments (/* ... */ and // ...) from code.
+    Args:
+        text (str): Raw C code
+    Returns:
+        str: Code with comments removed
+    """
+    pattern = r"/\*.*?\*/|//.*?$"
+    filtered_text = re.sub(pattern, "", text, flags=re.DOTALL | re.MULTILINE)
+    return filtered_text
+
+
+def identify_functions(code):
+    """
+    Identify function definitions in C code.
+    Args:
+        code (str): Filtered C code (no comments)
+    Returns:
+        list: Dictionary of function details (name, return type, parameters, body start position)
+    """
+    functions = []
+    # Regex pattern to match function definitions (supports common return types)
+    pattern = r'(void|int|char|float|double|struct|long|short|unsigned|signed)\s+([A-Za-z_]\w*)\s*\(([^()]*)\)\s*\{'
+    matches = re.finditer(pattern, code)
+
+    for match in matches:
+        return_type = match.group(1)
+        function_name = match.group(2)
+        parameters = [param.strip() for param in match.group(3).split(',')] if match.group(3).strip() else []
+        functions.append({
+            'function_name': function_name,
+            'return_type': return_type,
+            'parameters': parameters,
+            'body_start': match.end(),
+            'is_varargs': '...' in match.group(3)  # Mark if function is variadic
+        })
+    return functions
+
+
+def extract_function_body(code, start_pos):
+    """
+    Extract the body of a function from code using brace matching.
+    Args:
+        code (str): Filtered C code
+        start_pos (int): Position right after the function's opening brace
+    Returns:
+        str: Function body content (without outer braces)
+    """
+    open_braces = 1
+    current_pos = start_pos
+    while open_braces > 0 and current_pos < len(code):
+        if code[current_pos] == '{':
+            open_braces += 1
+        elif code[current_pos] == '}':
+            open_braces -= 1
+        current_pos += 1
+    return code[start_pos:current_pos - 1]
+
+
+def extract_execution_sequence(code, functions, current_function="main"):
+    """
+    Extract line-by-line execution sequence starting from the main function.
+    Recursively resolves nested function calls.
+    Args:
+        code (str): Filtered C code
+        functions (list): Function details from identify_functions()
+        current_function (str): Function to start execution from
+    Returns:
+        list: Ordered execution sequence of code lines
+    """
+    execution_sequence = []
+
+    def execute_line_by_line(func_name):
+        nonlocal execution_sequence
+
+        # Find target function and its body
+        target_func = next((f for f in functions if f['function_name'] == func_name), None)
+        if not target_func:
+            return
+
+        func_body = extract_function_body(code, target_func['body_start'])
+        # Add each non-empty line to execution sequence
+        for line in func_body.splitlines():
+            stripped_line = line.strip()
+            if stripped_line:
+                execution_sequence.append(stripped_line)
+                # Recursively execute nested function calls
+                for f in functions:
+                    if re.search(r'\b' + f['function_name'] + r'\b\s*\(', stripped_line):
+                        execute_line_by_line(f['function_name'])
+
+    execute_line_by_line(current_function)
+    return execution_sequence
+
+
+def find_variable_definitions(code_lines):
+    """
+    Identify variable and struct definitions in code lines.
+    Args:
+        code_lines (list): List of code lines (split by newline)
+    Returns:
+        tuple: (set of defined variable/struct names, list of (line_num, line_content))
+    """
+    defined_vars = set()
+    defined_lines = []
+
+    # Regex patterns for variable and struct definitions
+    variable_pattern = re.compile(
+        r'\b(?:int|float|double|char|void|long|short|unsigned|signed)\s+(\*?\s*\w+)(\s*=\s*[^;]*)?;?'
+    )
+    struct_pattern = re.compile(r'\bstruct\s+(\w+)\s+\w+\s*{')
+
+    for line_num, line in enumerate(code_lines, 1):
+        stripped_line = line.strip()
+
+        # Match basic variable definitions
+        var_matches = variable_pattern.findall(stripped_line)
+        if var_matches:
+            defined_lines.append((line_num, stripped_line))
+            for match in var_matches:
+                var_name = match[0].strip().replace('*', '').strip()
+                defined_vars.add(var_name)
+
+        # Match struct definitions
+        struct_matches = struct_pattern.findall(stripped_line)
+        if struct_matches:
+            defined_lines.append((line_num, stripped_line))
+            for struct_name in struct_matches:
+                defined_vars.add(struct_name.strip())
+
+    return defined_vars, defined_lines
+
+
+def read_file_and_find_definitions(code):
+    """
+    Wrapper function to find variable/struct definitions and print results.
+    Args:
+        code (str): Filtered C code
+    Returns:
+        tuple: (set of defined variable/struct names, list of (line_num, line_content))
+    """
+    code_lines = code.splitlines()
+    defined_vars, defined_lines = find_variable_definitions(code_lines)
+
+    print("\nIdentified Variable/Struct Definitions:")
+    for line_num, line in defined_lines:
+        print(f"Line {line_num}: {line}")
+
+    return defined_vars, defined_lines
+
+
+def extract_function_calls_with_args(code_line):
+    """
+    Extract function calls and their arguments from a code line.
+    Args:
+        code_line (str): Single line of C code
+    Returns:
+        list: Tuples of (function_name, arguments_string)
+    """
+    func_call_pattern = re.compile(r'(\w+)\s*\(([^)]*)\)')
+    return func_call_pattern.findall(code_line)
+
+
+def find_used_variables_in_c_code(code_line, functions, defined_vars):
+    """
+    Identify variables used in a code line (excludes functions and keywords).
+    Args:
+        code_line (str): Single line of C code
+        functions (list): Function details from identify_functions()
+        defined_vars (set): Defined variable/struct names
+    Returns:
+        set: Used variable names
+    """
+    used_vars = set()
+    function_names = {f['function_name'] for f in functions}
+
+    # Remove string literals to avoid false matches
+    code_line = re.sub(r'"[^"]*"', '', code_line)
+    code_line = re.sub(r"'[^']*'", '', code_line)
+
+    # Regex to match variables (supports pointers ->, array [], and struct .)
+    var_pattern = r'\b([a-zA-Z_]\w*(?:->|\.|\*)?[a-zA-Z_]\w*(\[\d*\])?)\b'
+    var_matches = re.findall(var_pattern, code_line)
+
+    for match in var_matches:
+        full_var = match[0]
+        # Clean variable name (remove pointers, array indices, struct accessors)
+        clean_var = re.sub(r'\*|->|\.|\[\d*\]', '', full_var).strip()
+        # Exclude functions, defined variables, and unwanted keywords
+        if (clean_var not in function_names and
+                clean_var not in unwanted_keywords and
+                clean_var not in defined_vars and
+                clean_var):
+            used_vars.add(full_var)
+            used_vars.add(clean_var)
+
+    return used_vars
+
+
+def analyze_free_statement(statement):
+    """
+    Analyze code line for memory deallocation operations (free/delete).
+    Args:
+        statement (str): Single line of C code
+    Returns:
+        str: Formatted free operation string (e.g., "free ptr") or None
+    """
+    # Match free() calls
+    free_pattern = r'free\s*\(\s*(\w+)\s*\);?'
+    free_match = re.search(free_pattern, statement)
+    if free_match:
+        return f"free {free_match.group(1)}"
+
+    # Match delete calls (supports array and single object)
+    delete_pattern = r'delete\s*(?:\[\s*\])?\s*(\w+)\s*;?'
+    delete_match = re.search(delete_pattern, statement)
+    if delete_match:
+        return f"free {delete_match.group(1)}"  # Align with paper's free representation
+
+    return None
+
+
+def extract_malloc_calls(code_string):
+    """
+    Extract memory allocation operations (malloc) from code.
+    Args:
+        code_string (str): C code (single line or multi-line)
+    Returns:
+        tuple: (list of "malloc" strings, list of allocated variable names)
+    """
+    # Match malloc with assignment (e.g., int *p = (int*)malloc(...))
+    malloc_pattern = r'(\w+)\s*=\s*\(.*?\)\s*malloc\s*\((.*?)\)'
+    matches = re.findall(malloc_pattern, code_string, re.DOTALL)
+
+    processes = []
+    variables = []
+    for var_name, _ in matches:
+        processes.append("malloc")
+        variables.append(var_name.strip())
+
+    return processes, variables
+
+
+def extract_use_features(code):
+    """
+    Extract memory usage features (variable accesses) from code.
+    Args:
+        code (str): C code (single line or multi-line)
+    Returns:
+        list: Formatted use operation strings (e.g., "use ptr (line 5)")
+    """
+    use_features = []
+    variable_id_map = {}
+    next_id = 1
+
+    # Regex patterns for variable usage (assignment, access, array access)
+    use_patterns = [
+        r'([a-zA-Z_]\w*)\s*=\s*.+;',  # Variable assignment (lhs)
+        r'\w+\s*\(\s*&?([a-zA-Z_]\w*)\s*\);',  # Function argument (variable)
+        r'([a-zA-Z_]\w*)\s*\[\s*.+\s*\]',  # Array access
+        r'->([a-zA-Z_]\w*)',  # Pointer struct member access
+        r'\.([a-zA-Z_]\w*)'  # Struct member access
+    ]
+
+    for line_num, line in enumerate(code.splitlines(), 1):
+        stripped_line = line.strip()
+        if not stripped_line or stripped_line.startswith(('#', '//')):
+            continue
+
+        # Check all usage patterns
+        for pattern in use_patterns:
+            matches = re.findall(pattern, stripped_line)
+            for var_name in matches:
+                if var_name and var_name not in unwanted_keywords:
+                    if var_name not in variable_id_map:
+                        variable_id_map[var_name] = f"data{next_id}"
+                        next_id += 1
+                    use_features.append(f"use {variable_id_map[var_name]} (line {line_num})")
+
+    return use_features
+
+
+# ========================= CORE ENHANCEMENT 1: Pointer Alias Tracking (with Type Cast Implicit Aliases) =========================
+def track_pointer_aliases(statement, unwanted_keywords):
+    """
+    Enhanced pointer alias tracking: supports explicit assignment aliases + Type Cast implicit aliases
+    Recognizes:
+    1. Direct pointer alias: p2 = p1
+    2. Reference alias: p2 = &p1
+    3. C-style type cast alias: p2 = (int*)p1
+    4. C++ static_cast/reinterpret_cast alias: p2 = static_cast<int*>(p1)
+    Filters: self-aliases, numeric copies, non-pointer type casts
+    """
+    # Priority 1: Implicit aliases from Type Cast (most commonly missed)
+    cast_patterns = [
+        # C-style cast: (type*)src
+        r'(\*?[a-zA-Z_]\w*)\s*=\s*\(\s*[a-zA-Z_]\w*\s*\*\s*\)\s*(\*?[a-zA-Z_]\w*)\s*;',
+        # C++ static_cast
+        r'(\*?[a-zA-Z_]\w*)\s*=\s*static_cast\s*<\s*[a-zA-Z_]\w*\s*\*\s*>\s*\(\s*(\*?[a-zA-Z_]\w*)\s*\)\s*;',
+        # C++ reinterpret_cast
+        r'(\*?[a-zA-Z_]\w*)\s*=\s*reinterpret_cast\s*<\s*[a-zA-Z_]\w*\s*\*\s*>\s*\(\s*(\*?[a-zA-Z_]\w*)\s*\)\s*;'
+    ]
+
+    for pattern in cast_patterns:
+        cast_match = re.search(pattern, statement)
+        if cast_match:
+            dest_ptr, src_ptr = cast_match.group(1), cast_match.group(2)
+            # Filter invalid casts
+            if (dest_ptr not in unwanted_keywords and
+                    src_ptr not in unwanted_keywords and
+                    not dest_ptr.isdigit() and
+                    not src_ptr.isdigit() and
+                    dest_ptr != src_ptr):
+                # Mark as cast alias to distinguish from regular aliases
+                return f"cast_alias {src_ptr} -> {dest_ptr}"
+
+    # Priority 2: Direct pointer alias
+    pointer_alias_pattern = r'(\*?[a-zA-Z_]\w*)\s*=\s*(\*?[a-zA-Z_]\w*)\s*;'
+    # Priority 3: Reference alias
+    ref_alias_pattern = r'([a-zA-Z_]\w*)\s*=\s*&\s*([a-zA-Z_]\w*)\s*;'
+
+    alias_match = re.search(pointer_alias_pattern, statement)
+    if not alias_match:
+        alias_match = re.search(ref_alias_pattern, statement)
+
+    if alias_match:
+        dest_ptr, src_ptr = alias_match.group(1), alias_match.group(2)
+        if (dest_ptr not in unwanted_keywords and
+                src_ptr not in unwanted_keywords and
+                not dest_ptr.isdigit() and
+                not src_ptr.isdigit() and
+                dest_ptr != src_ptr):
+            return f"alias {src_ptr} -> {dest_ptr}"
+
+    return None
+
+
+# ========================= CORE ENHANCEMENT 2: VarArgs Variadic Parameter Node Detection =========================
+def extract_vastart(statement):
+    """Extract va_start macro call node: va_start(ap, last_param)"""
+    vastart_pattern = r'va_start\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*;'
+    match = re.search(vastart_pattern, statement)
+    if match:
+        ap_var = match.group(1)
+        last_param = match.group(2)
+        return f"vastart {ap_var} {last_param}"
+    return None
+
+
+def extract_vaarg(statement):
+    """Extract va_arg macro call node: va_arg(ap, type), supports complex pointer types"""
+    vaarg_pattern = r'va_arg\s*\(\s*(\w+)\s*,\s*([^)]+)\s*\)\s*'
+    match = re.search(vaarg_pattern, statement)
+    if match:
+        ap_var = match.group(1)
+        arg_type = match.group(2).strip()
+        # Simplify type display, keep core identifier
+        simple_type = re.sub(r'.*?(\w+)\s*\*?$', r'\1', arg_type)
+        return f"vaarg {ap_var} {simple_type}"
+    return None
+
+
+def extract_varargs_calls(statement, functions):
+    """
+    Extract variadic function call nodes:
+    1. Predefined standard library variadic functions
+    2. Auto-detect custom variadic functions with ... in definition
+    """
+    # Standard library variadic functions (extendable)
+    std_varargs_funcs = {
+        'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 'vsprintf', 'vsnprintf',
+        'scanf', 'fscanf', 'sscanf', 'vscanf', 'vfscanf', 'vsscanf',
+        'syslog', 'vsyslog', 'err', 'verr', 'warn', 'vwarn'
+    }
+
+    # Combine with custom variadic functions detected in code
+    custom_varargs_funcs = {f['function_name'] for f in functions if f.get('is_varargs', False)}
+    all_varargs_funcs = std_varargs_funcs.union(custom_varargs_funcs)
+
+    for func_name in all_varargs_funcs:
+        escaped_func = re.escape(func_name)
+        pattern = rf'\b{escaped_func}\s*\('
+        if re.search(pattern, statement):
+            return f"varargs {func_name}"
+    return None
+
+
+def extract_data_copy_features(code, unwanted_keywords):
+    """
+    Extract data copying operations AND pointer aliases (paper's trapezoid feature).
+    Updated to prioritize pointer aliases (core UAF requirement) over data copies.
+    Returns: list: Formatted copy/alias operation strings
+    """
+    copy_alias_features = []
+
+    for line_num, line in enumerate(code.splitlines(), 1):
+        stripped_line = line.strip()
+        if not stripped_line:
+            continue
+
+        # Step 1: Check for pointer aliases FIRST (trapezoid priority)
+        alias_str = track_pointer_aliases(stripped_line, unwanted_keywords)
+        if alias_str:
+            copy_alias_features.append(f"{alias_str} (line {line_num})")
+            continue  # Skip data copy if alias is found
+
+        # Step 2: Original data copy detection (preserved unchanged)
+        copy_patterns = [
+            # Direct copy: var2 = var1
+            r'(\w+)\s*=\s*(\w+)\s*;',
+            # Pointer copy: *var2 = *var1
+            r'\*(\w+)\s*=\s*\*(\w+)\s*;',
+            # Struct member copy: var2->mem = var1->mem or var2.mem = var1.mem
+            r'(\w+)(?:->|\.)(\w+)\s*=\s*(\w+)(?:->|\.)\2\s*;'
+        ]
+
+        for pattern in copy_patterns:
+            matches = re.findall(pattern, stripped_line)
+            for match in matches:
+                if len(match) == 2:
+                    dest_var, src_var = match[0], match[1]
+                    if dest_var not in unwanted_keywords and src_var not in unwanted_keywords:
+                        copy_alias_features.append(f"copy {src_var} -> {dest_var} (line {line_num})")
+                elif len(match) == 3:
+                    dest_var, mem, src_var = match[0], match[1], match[2]
+                    if dest_var not in unwanted_keywords and src_var not in unwanted_keywords:
+                        copy_alias_features.append(f"copy {src_var}->{mem} -> {dest_var}->{mem} (line {line_num})")
+
+    return copy_alias_features
+
+
+# ========================= ENHANCED DRAWING FUNCTION (VarArgs Nodes + Type Cast Aliases) =========================
+def draw_graph(used_varlist):
+    """
+    Enhanced visualization:
+    - Original nodes: malloc(circle), use(rectangle), free(triangle), copy(light yellow trapezoid), alias(ivory trapezoid)
+    - New nodes: vastart(diamond), vaarg(octagon), varargs(pentagon), cast_alias(orange trapezoid)
+    """
+    import math  # For polygon vertex calculation
+
+    plt.figure(figsize=(16, 9))  # Widen canvas to accommodate more nodes
+    ax = plt.gca()
+    ax.set_xlim(-1, len(used_varlist) * 2.5)
+    ax.set_ylim(-2.5, 2.5)
+    ax.axis('off')
+
+    variable_id_map = {}
+    next_var_id = 1
+    base_h = 0.8
+    poly_w = 0.7
+
+    for idx, op in enumerate(used_varlist):
+        x_pos = idx * 2.5
+        y_pos = 0
+
+        # Original nodes (unchanged)
+        if op.startswith("malloc"):
+            var_name = op.split()[1] if len(op.split()) > 1 else f"ptr{next_var_id}"
+            if var_name not in variable_id_map:
+                variable_id_map[var_name] = next_var_id
+                next_var_id += 1
+            var_id = variable_id_map[var_name]
+
+            circle = Circle((x_pos, y_pos), 0.5, facecolor='lightcoral', edgecolor='black', linewidth=1.5)
+            ax.add_patch(circle)
+            ax.text(x_pos, y_pos, f"malloc\nvar{var_id}", ha='center', va='center', fontsize=9, fontweight='bold')
+
+        elif op.startswith("use"):
+            parts = op.split()
+            data_id = parts[1] if len(parts) > 1 else f"data{next_var_id}"
+            if data_id not in variable_id_map:
+                variable_id_map[data_id] = next_var_id
+                next_var_id += 1
+            var_id = variable_id_map[data_id]
+
+            rect = Rectangle((x_pos - 0.6, y_pos - 0.4), 1.2, 0.8, facecolor='lightblue', edgecolor='black',
+                             linewidth=1.5)
+            ax.add_patch(rect)
+            ax.text(x_pos, y_pos, f"use\n{data_id}", ha='center', va='center', fontsize=9, fontweight='bold')
+
+        elif op.startswith("free"):
+            var_name = op.split()[1] if len(op.split()) > 1 else f"ptr{next_var_id}"
+            if var_name not in variable_id_map:
+                variable_id_map[var_name] = next_var_id
+                next_var_id += 1
+            var_id = variable_id_map[var_name]
+
+            triangle = Polygon([(x_pos - 0.6, y_pos - 0.4), (x_pos + 0.6, y_pos - 0.4), (x_pos, y_pos + 0.4)],
+                               facecolor='lightgreen', edgecolor='black', linewidth=1.5)
+            ax.add_patch(triangle)
+            ax.text(x_pos, y_pos - 0.1, f"free\nvar{var_id}", ha='center', va='center', fontsize=9, fontweight='bold')
+
+        elif op.startswith("copy") or op.startswith("alias") or op.startswith("cast_alias"):
+            copy_match = re.search(r'(copy|alias|cast_alias)\s+([\w->]+)\s+->\s+([\w->]+)', op)
+            if copy_match:
+                op_type = copy_match.group(1)
+                src = copy_match.group(2)
+                dest = copy_match.group(3)
+
+                for var in [src, dest]:
+                    if var not in variable_id_map:
+                        variable_id_map[var] = next_var_id
+                        next_var_id += 1
+                src_id = variable_id_map[src]
+                dest_id = variable_id_map[dest]
+
+                # Distinguish three trapezoid colors
+                if op_type == 'copy':
+                    fill_color = 'lightyellow'
+                elif op_type == 'alias':
+                    fill_color = 'ivory'
+                else:  # cast_alias
+                    fill_color = 'orange'
+
+                trapezoid = Trapezoid(
+                    xy=(x_pos - 0.8, y_pos - 0.3),
+                    width=1.6,
+                    height=0.6,
+                    angle=15,
+                    facecolor=fill_color,
+                    edgecolor='black',
+                    linewidth=1.5
+                )
+                ax.add_patch(trapezoid)
+
+                label_text = f"{op_type}\n{src_id}→{dest_id}"
+                ax.text(x_pos, y_pos, label_text, ha='center', va='center', fontsize=8, fontweight='bold')
+
+        # ========================= NEW: VarArgs Node Rendering =========================
+        elif op.startswith("vastart"):
+            # VaStart: Diamond, lavender
+            parts = op.split()
+            ap_var = parts[1]
+            if ap_var not in variable_id_map:
+                variable_id_map[ap_var] = next_var_id
+                next_var_id += 1
+            ap_id = variable_id_map[ap_var]
+            diamond_pts = [
+                (x_pos, y_pos + base_h / 2),
+                (x_pos + poly_w / 2, y_pos),
+                (x_pos, y_pos - base_h / 2),
+                (x_pos - poly_w / 2, y_pos)
+            ]
+            diamond = Polygon(diamond_pts, facecolor='lavender', edgecolor='black', linewidth=1.5)
+            ax.add_patch(diamond)
+            ax.text(x_pos, y_pos, f"VS:{ap_id}", ha='center', va='center', fontsize=10, fontweight='bold')
+
+        elif op.startswith("vaarg"):
+            # VaArg: Octagon, thistle
+            parts = op.split()
+            ap_var = parts[1]
+            arg_type = parts[2]
+            if ap_var not in variable_id_map:
+                variable_id_map[ap_var] = next_var_id
+                next_var_id += 1
+            ap_id = variable_id_map[ap_var]
+            oct_pts = []
+            for i in range(8):
+                angle = i * 45 * math.pi / 180
+                oct_pts.append((
+                    x_pos + poly_w / 2 * 0.7 * math.cos(angle),
+                    y_pos + base_h / 2 * 0.7 * math.sin(angle)
+                ))
+            octagon = Polygon(oct_pts, facecolor='thistle', edgecolor='black', linewidth=1.5)
+            ax.add_patch(octagon)
+            ax.text(x_pos, y_pos, f"VA:{ap_id}\n{arg_type}", ha='center', va='center', fontsize=8, fontweight='bold')
+
+        elif op.startswith("varargs"):
+            # VarArgsCall: Pentagon, lightpink
+            func_name = op.split()[1]
+            pent_pts = []
+            for i in range(5):
+                angle = (i * 72 - 90) * math.pi / 180  # Vertex pointing up
+                pent_pts.append((
+                    x_pos + poly_w / 2 * math.cos(angle),
+                    y_pos + base_h / 2 * math.sin(angle)
+                ))
+            pentagon = Polygon(pent_pts, facecolor='lightpink', edgecolor='black', linewidth=1.5)
+            ax.add_patch(pentagon)
+            ax.text(x_pos, y_pos, f"VC\n{func_name[:6]}", ha='center', va='center', fontsize=8, fontweight='bold')
+
+        # Bottom step numbering
+        ax.text(x_pos, y_pos - 1.5, f"Step {idx + 1}", ha='center', va='center', fontsize=8, color='gray')
+
+    # Updated complete legend
+    legend_elements = [
+        Circle((0, 0), 0.1, facecolor='lightcoral', edgecolor='black', label='Allocation (malloc)'),
+        Rectangle((0, 0), 0.2, 0.15, facecolor='lightblue', edgecolor='black', label='Usage (use)'),
+        Polygon([(0, 0), (0.2, 0), (0.1, 0.15)], facecolor='lightgreen', edgecolor='black',
+                label='Deallocation (free)'),
+        Trapezoid((0, 0), 0.2, 0.15, 0.1, facecolor='lightyellow', edgecolor='black', label='Data Copy'),
+        Trapezoid((0, 0), 0.2, 0.15, 0.1, facecolor='ivory', edgecolor='black', label='Pointer Alias'),
+        Trapezoid((0, 0), 0.2, 0.15, 0.1, facecolor='orange', edgecolor='black', label='Type Cast Alias'),
+        Polygon([(0, 0.1), (0.1, 0), (0, -0.1), (-0.1, 0)], facecolor='lavender', edgecolor='black', label='va_start'),
+        Polygon([(math.cos(i * 45 * math.pi / 180) * 0.1, math.sin(i * 45 * math.pi / 180) * 0.1) for i in range(8)],
+                facecolor='thistle', edgecolor='black', label='va_arg'),
+        Polygon([(math.cos((i * 72 - 90) * math.pi / 180) * 0.1, math.sin((i * 72 - 90) * math.pi / 180) * 0.1) for i in
+                 range(5)],
+                facecolor='lightpink', edgecolor='black', label='VarArgs Call')
+    ]
+    ax.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=3, fontsize=9)
+
+    plt.title('UAF Static Analysis Visual Features (VarArgs + Type Cast Support)', fontsize=14, fontweight='bold',
+              pad=20)
+    plt.tight_layout()
+    plt.savefig("uaf_visual_features.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print("\n✅ Visualization saved as uaf_visual_features.png")
+
+
+def extract_uaf_features(use_lines):
+    """
+    Extract UAF-related use features from use operation lines.
+    Args:
+        use_lines (list): Formatted use operation strings
+    Returns:
+        list: Standardized use features (e.g., "use data1 (line 5)")
+    """
+    uaf_features = []
+    variable_map = {}
+    data_counter = 1
+
+    for line in use_lines:
+        # Match pattern: "use dataX (line N)" or "use var (line N)"
+        match = re.match(r"use\s+([\w\d]+)\s*\(line\s+(\d+)\)", line)
+        if match:
+            var_name = match.group(1)
+            line_num = match.group(2)
+
+            if var_name not in variable_map:
+                variable_map[var_name] = f"data{data_counter}"
+                data_counter += 1
+
+            uaf_features.append(f"use {variable_map[var_name]} (line {line_num})")
+
+    return uaf_features
+
+
+def main():
+    """
+    Enhanced main workflow: added VarArgs and Type Cast alias extraction steps
+    """
+    global unwanted_keywords
+    # Common C keywords and non-variable identifiers to exclude
+    unwanted_keywords = [
+        'int', 'char', 'float', 'double', 'void', 'long', 'short', 'unsigned', 'signed',
+        'size_t', 'int8_t', 'int16_t', 'int32_t', 'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+        'NULL', 'malloc', 'sizeof', 'exit', 'std_testcase', 'tmpl', 'h', 'tools', 'It', 'argv', 'argc', 'good',
+        'Calling', 'Finished', 'label', 'wchar', 'c', 'bad', 'endif', 'OMITBAD', 'ifndef', 'define', 'ifdef', 'include',
+        'return', 'OMITGOOD', 'else', 'INCLUDEMAIN', 'static', 'for', 'while', 'if', 'switch', 'case', 'break',
+        'continue', 'default', 'goto', 'sink', 'source', 'namespace', 'using', 'class', 'struct', 'public', 'private',
+        'protected', 'template', 'typename', 'new', 'delete', 'operator', 'typedef', 'const', 'enum', 'volatile',
+        'register', 'extern', 'mutable', 'friend', 'inline', 'virtual', 'explicit', 'this', 'throw', 'catch', 'try',
+        'noexcept', 'constexpr', 'decltype', 'thread_local', 'alignas', 'alignof', 'static_assert', 'concept',
+        'requires', 'wchar_t', 'va_list', 'va_start', 'va_arg', 'va_end'  # Add VarArgs macros to blacklist
+    ]
+
+    # Directory containing C code files
+    folder_path = r'E:\Documents\phd\zhang\uaf\vlm\vlm\genchangename'
+    if not os.path.exists(folder_path):
+        print(f"Error: Directory {folder_path} does not exist.")
+        return
+
+    # Get all C files in directory
+    file_list = [f for f in os.listdir(folder_path) if
+                 f.endswith('.c') and os.path.isfile(os.path.join(folder_path, f))]
+    if not file_list:
+        print("Error: No .c files found in the directory.")
+        return
+
+    for filename in file_list:
+        file_path = os.path.join(folder_path, filename)
+        print(f"\n{'=' * 60}")
+        print(f"Processing File: {filename}")
+        print(f"{'=' * 60}")
+
+        # Load and preprocess code
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+            raw_code = file.read()
+
+        # Step 1: Remove comments
+        filtered_code = filter_comments(raw_code)
+        print("\nFiltered Code (No Comments):")
+        print(filtered_code[:500] + "..." if len(filtered_code) > 500 else filtered_code)
+
+        # Step 2: Identify functions (auto-detect custom variadic functions)
+        functions = identify_functions(filtered_code)
+        print("\nIdentified Functions:")
+        for func in functions:
+            varargs_mark = " [VARARGS]" if func.get('is_varargs', False) else ""
+            print(f"- {func['return_type']} {func['function_name']}({', '.join(func['parameters'])}){varargs_mark}")
+
+        # Step 3: Extract execution sequence
+        execution_sequence = extract_execution_sequence(filtered_code, functions)
+        print("\nExecution Sequence (Line-by-Line):")
+        for seq in execution_sequence[:20]:
+            print(f"  {seq}")
+        if len(execution_sequence) > 20:
+            print(f"  ... (total {len(execution_sequence)} lines)")
+
+        # Step 4: Find variable/struct definitions
+        defined_vars, _ = read_file_and_find_definitions(filtered_code)
+
+        # Step 5: Extract memory operations (added VarArgs and Type Cast aliases)
+        used_varlist = []
+        statements = split_c_code_by_semicolon_and_braces(filtered_code)
+
+        for stmt in statements:
+            if not stmt:
+                continue
+
+            # Original operation extraction
+            malloc_processes, malloc_vars = extract_malloc_calls(stmt)
+            for proc, var in zip(malloc_processes, malloc_vars):
+                used_varlist.append(f"{proc} {var}")
+
+            free_op = analyze_free_statement(stmt)
+            if free_op:
+                used_varlist.append(free_op)
+
+            use_features = extract_use_features(stmt)
+            used_varlist.extend(use_features)
+
+            copy_alias_features = extract_data_copy_features(stmt, unwanted_keywords)
+            used_varlist.extend(copy_alias_features)
+
+            # New: VarArgs node extraction
+            vastart_op = extract_vastart(stmt)
+            if vastart_op:
+                used_varlist.append(vastart_op)
+
+            vaarg_op = extract_vaarg(stmt)
+            if vaarg_op:
+                used_varlist.append(vaarg_op)
+
+            varargs_call_op = extract_varargs_calls(stmt, functions)
+            if varargs_call_op:
+                used_varlist.append(varargs_call_op)
+
+        # Step 6: Print extracted features
+        print("\nExtracted Memory Operations & Features:")
+        for feature in used_varlist:
+            print(f"  {feature}")
+
+        # Step 7: Generate visual diagram
+        if used_varlist:
+            print("\nGenerating Visual Features Diagram...")
+            draw_graph(used_varlist)
+        else:
+            print("\nNo memory operations found in the file.")
+
+
+if __name__ == "__main__":
+    main()
