@@ -1,0 +1,266 @@
+import re
+import matplotlib.pyplot as plt
+import os
+
+# Global constant: Fixed variable ID mapping
+VAR_ID_MAP = {
+    "set": 1,
+    "rule": 2,
+    "trans": 3
+}
+
+# ===================== Preprocessing Utilities =====================
+def filter_comments(text):
+    """Remove single-line and multi-line comments from C code"""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    return text
+
+
+def identify_functions(code):
+    """Extract all function names, return types, and function body start indices"""
+    functions = []
+    # Match C function definitions: void/int/char/struct func(...) {
+    pattern = r'(void|int|char|float|double|struct)\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{'
+    for match in re.finditer(pattern, code):
+        func_name = match.group(2)
+        start_idx = match.end()
+        functions.append({
+            "name": func_name,
+            "start": start_idx
+        })
+    # Cache complete function body for each function
+    func_body_map = {}
+    for func in functions:
+        pos = func["start"]
+        brace_count = 1
+        while pos < len(code) and brace_count > 0:
+            if code[pos] == '{':
+                brace_count += 1
+            elif code[pos] == '}':
+                brace_count -= 1
+            pos += 1
+        body = code[func["start"]:pos - 1]
+        func_body_map[func["name"]] = body
+    return functions, func_body_map
+
+
+# ===================== Execution Flow Construction =====================
+def build_execution_flow(func_body_map, entry_list, pointer_map=None):
+    """Build complete execution flow with function pointer resolution"""
+    if pointer_map is None:
+        pointer_map = {}
+    execution_list = []
+    visited_functions = set()
+
+    def dfs(func_name):
+        """Depth-first search to traverse function call graph"""
+        if func_name not in func_body_map or func_name in visited_functions:
+            return
+        visited_functions.add(func_name)
+        body = func_body_map[func_name]
+        lines = body.splitlines()
+        for line_no_offset, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            execution_list.append((func_name, line))
+            # Extract all function calls
+            calls = set()
+            # Match direct function calls: func(
+            for match in re.finditer(r"\b([A-Za-z_]\w+)\s*\(", line):
+                calls.add(match.group(1))
+            # Match function pointer calls: ->func( .func(
+            for match in re.finditer(r"(?:->|\.)([A-Za-z_]\w+)\s*\(", line):
+                calls.add(match.group(1))
+            # Recursively enter all called functions
+            for callee in calls:
+                dfs(callee)
+                # Resolve function pointers using predefined mapping
+                if callee in pointer_map:
+                    real_func = pointer_map[callee]
+                    dfs(real_func)
+
+    for entry_point in entry_list:
+        dfs(entry_point)
+    return execution_list
+
+
+# ===================== Memory Operation Parsing =====================
+def extract_malloc(line):
+    """Extract memory allocation operations: var = malloc/kvmalloc(...)"""
+    pattern = r"([A-Za-z_]\w+)\s*=\s*\(.*?\)?(malloc|kvmalloc)\s*\("
+    results = []
+    for match in re.findall(pattern, line):
+        var = match[0]
+        results.append(f"malloc {var}")
+    return results
+
+
+def extract_free(line):
+    """Extract memory free operations: only return variable name, discard function name"""
+    pattern = r"(kfree|kvfree|free)\s*\(\s*([A-Za-z_]\w+)\s*\)"
+    match = re.search(pattern, line)
+    if match:
+        free_var = match.group(2)
+        return f"free {free_var}"
+    return None
+
+
+def extract_use_vars(line, blacklist, func_names):
+    """Extract real variable usage, filter functions, macros, keywords, and exclude free statements"""
+    use_features = []
+    # Step 1: Remove all free statements to avoid extracting use from free operations
+    line_clean = re.sub(r"\b(kfree|kvfree|free)\s*\([^)]*\)\s*;?", "", line)
+    # Step 2: Match variable access patterns with word boundaries
+    var_pattern = r"\b([A-Za-z_]\w+(?:->|\.[A-Za-z_]\w+)*(?:\[\d*\])?)\b"
+    all_matches = re.findall(var_pattern, line_clean)
+    unique_vars = set()
+    for full_expr in all_matches:
+        base_var = re.split(r"->|\.", full_expr)[0]
+        # Filter out blacklisted items, function names, and non-target variables
+        if (base_var in blacklist or
+            base_var in func_names or
+            base_var not in VAR_ID_MAP):
+            continue
+        unique_vars.add(base_var)
+    for var in unique_vars:
+        use_features.append(f"use {var}")
+    return use_features
+
+
+# ===================== Visualization Module =====================
+def draw_uaf_flow(feature_list):
+    """Draw UAF memory operation sequence graph"""
+    plt.figure(figsize=(16, 6))
+    pos_map = {}
+    shape_map = {}
+    text_map = {}
+    idx = 0
+    for feature in feature_list:
+        parts = feature.split()
+        if len(parts) < 2:
+            continue
+        action, var = parts[0], parts[1]
+        if var not in VAR_ID_MAP:
+            continue
+        # Determine shape based on operation type
+        if action == "malloc":
+            shape = "circle"
+        elif action == "free":
+            shape = "triangle"
+        elif action == "use":
+            shape = "square"
+        else:
+            continue
+        pos_map[idx] = (idx * 2, 0)
+        shape_map[idx] = shape
+        text_map[idx] = VAR_ID_MAP[var]
+        idx += 1
+    # Draw all shapes
+    ax = plt.gca()
+    for i in range(len(pos_map)):
+        x, y = pos_map[i]
+        shape = shape_map[i]
+        num = text_map[i]
+        if shape == "circle":
+            # Red circle for malloc operations
+            circ = plt.Circle((x, y), 0.5, fc="lightcoral", ec="black")
+            ax.add_patch(circ)
+        elif shape == "triangle":
+            # Green triangle for free operations
+            poly = plt.Polygon([[x - 0.5, y - 0.5], [x + 0.5, y - 0.5], [x, y + 0.5]], fc="lightgreen", ec="black")
+            ax.add_patch(poly)
+        elif shape == "square":
+            # Blue square for use operations
+            rect = plt.Rectangle((x - 0.5, y - 0.5), 1, 1, fc="lightblue", ec="black")
+            ax.add_patch(rect)
+        plt.text(x, y, str(num), ha="center", va="center", fontsize=12)
+    plt.xlim(-1, len(pos_map) * 2)
+    plt.ylim(-1, 1)
+    plt.axis("off")
+    plt.title("CVE-2023-32233: Full Memory Sequence (set=1, rule=2, trans=3)")
+    plt.show()
+
+
+# ===================== Main Entry Point =====================
+def main():
+    # Blacklist: keywords, types, macros, allocation/free functions, struct names, function prefixes
+    blacklist = {
+        "int", "char", "float", "double", "void", "long", "short", "unsigned", "signed",
+        "size_t", "u32", "NULL", "malloc", "kvmalloc", "kfree", "kvfree", "free", "sizeof",
+        "NFT_MSG_DELRULE", "NFT_MSG_DELSETELEM", "struct", "static", "inline", "return", "break",
+        "if", "switch", "case", "for", "while", "else", "expr", "ext", "priv", "msg_type", "data",
+        "nft_set_ops", "nft_set_elem", "nft_set_ext", "nft_set", "nft_trans", "nft_rule",
+        "nft_expr", "nft_lookup", "nft_trans_elem", "nf_tables_rule_destroy",
+        "nft_trans_elem_set", "nf_tables_set_elem_destroy", "nft_set_elem_ext", "ops", "destroy",
+        "name", "priv", "stale_set", "elem"
+    }
+
+    folder = r"D:\zhang\uaf"
+    target_file = "publicizedcveuafmine2mini.txt"
+    file_path = os.path.join(folder, target_file)
+    with open(file_path, "r", encoding="utf-8") as f:
+        raw_code = f.read()
+
+    # Step 1: Preprocess code by removing comments
+    clean_code = filter_comments(raw_code)
+    # Step 2: Extract all functions and cache their bodies
+    all_funcs, func_body_dict = identify_functions(clean_code)
+    # Extract all function names for filtering
+    func_names = {f["name"] for f in all_funcs}
+
+    # Step 3: Function pointer mapping table (resolve kernel function pointers)
+    pointer_dispatch = {
+        "destroy": "nft_lookup_destroy"
+    }
+
+    # Step 4: Build complete execution flow starting from entry point
+    entry_points = ["nft_commit_release"]
+    exec_flow = build_execution_flow(func_body_dict, entry_points, pointer_dispatch)
+
+    # Step 5: Parse memory features line by line
+    all_features = []
+    print("========== Execution Flow ==========")
+    for func_name, line in exec_flow:
+        print(f"[{func_name}] {line}")
+        # Extract allocation features
+        mallocs = extract_malloc(line)
+        all_features.extend(mallocs)
+        # Extract free features
+        free_feat = extract_free(line)
+        if free_feat:
+            all_features.append(free_feat)
+        # Extract use features (filtered)
+        uses = extract_use_vars(line, blacklist, func_names)
+        all_features.extend(uses)
+
+    # Output clean memory operation sequence
+    print("\n========== Clean Memory Operation Sequence ==========")
+    for feature in all_features:
+        print(feature)
+
+    # Automatic UAF vulnerability detection
+    print("\n========== UAF Detection Result ==========")
+    freed_vars = set()
+    uaf_found = False
+    for feature in all_features:
+        parts = feature.split()
+        if len(parts) < 2:
+            continue
+        action, var = parts[0], parts[1]
+        if action == "free":
+            freed_vars.add(var)
+        elif action == "use" and var in freed_vars:
+            print(f"⚠️  UAF DETECTED! Variable '{var}' (id={VAR_ID_MAP[var]}) used after being freed")
+            uaf_found = True
+
+    if not uaf_found:
+        print("✅ No UAF detected")
+
+    # Draw the final UAF sequence diagram
+    draw_uaf_flow(all_features)
+
+
+if __name__ == "__main__":
+    main()
