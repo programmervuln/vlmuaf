@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel, LongformerSelfAttention, LongformerConfig, LongformerModel
-from torchvision import transforms  # 补充缺失的transforms导入
+from torchvision import transforms  
 import logging
 import math
 
@@ -518,12 +518,12 @@ if __name__ == "__main__":
 
     # -------------------------- Load CLIP Model --------------------------
     try:
-        # 优先加载本地模型（论文使用的预训练CLIP）
+        
         clip_model = CLIPModel.from_pretrained('/zhangliqiang/clip/copyfolder/vlm0/clip-model').to(device)
         clip_processor = CLIPProcessor.from_pretrained('/zhangliqiang/clip/copyfolder/vlm0/clip-model')
         logger.info("Loaded local CLIP model successfully.")
     except Exception as e:
-        # 本地无模型时在线加载（提升代码可复现性）
+        
         logger.warning(f"Local CLIP model load failed: {str(e)}. Trying to load online model...")
         clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
         clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
