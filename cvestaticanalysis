@@ -1,0 +1,263 @@
+import re
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
+
+def filter_comments(text):
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    return text
+
+def identify_functions(code):
+    funcs = []
+    pat = r'(void|int|char|float|double|struct)\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{'
+    for m in re.finditer(pat, code):
+        func_name = m.group(2)
+        start_idx = m.end()
+        funcs.append({"name": func_name, "start": start_idx})
+    func_body_map = {}
+    for f in funcs:
+        pos = f["start"]
+        brace = 1
+        while pos < len(code) and brace > 0:
+            if code[pos] == '{':
+                brace += 1
+            elif code[pos] == '}':
+                brace -= 1
+            pos += 1
+        body = code[f["start"]:pos-1]
+        func_body_map[f["name"]] = body
+    return funcs, func_body_map
+
+
+def build_execution_flow(func_body_map, entry_list):
+    exec_list = []
+    visited_func = set()
+
+    def dfs(func_name):
+        if func_name not in func_body_map or func_name in visited_func:
+            return
+        visited_func.add(func_name)
+        body = func_body_map[func_name]
+        lines = body.splitlines()
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            exec_list.append((func_name, line))
+            calls = set(re.findall(r"\b([A-Za-z_]\w+)\s*\(", line))
+            for callee in calls:
+                if callee not in visited_func:
+                    dfs(callee)
+    for entry in entry_list:
+        dfs(entry)
+    return exec_list
+
+
+def extract_malloc(line):
+    pat = r"([A-Za-z_]\w+)\s*=\s*sqlite3DbMallocZero\s*\("
+    res = []
+    for m in re.findall(pat, line):
+        var = m[0]
+        res.append(f"malloc {var}")
+    return res
+
+def extract_free(line):
+    print(f"\n[FREE_SCAN_LINE] |{line}|")
+    pat = r"(jsonParseFree|free|kfree|kvfree)\s*\(\s*([\w>[\]]+)\s*\)"
+    match = re.search(pat, line)
+    if match:
+        f_name = match.group(1)
+        v_name = match.group(2)
+        print(f"✅ MATCHED FREE: func={f_name}, var={v_name}")
+        return f"free {v_name}"
+    print(f"❌ NO FREE MATCH")
+    return None
+
+def extract_use_vars(line, var_blacklist):
+    use_feats = []
+    composite_pat = r"[A-Za-z_]\w+(?:->[A-Za-z_]\w+)+(?:\[\d+\])?"
+    simple_pat = r"\b([A-Za-z_]\w+)\b(?!\s*\()"
+
+    composite_matches = re.findall(composite_pat, line)
+    simple_matches = re.findall(simple_pat, line)
+
+    unique_vars = set()
+    for expr in composite_matches:
+        base = expr.split("->")[0]
+        if base not in var_blacklist:
+            unique_vars.add(expr)
+    for var in simple_matches:
+        if var not in var_blacklist:
+            unique_vars.add(var)
+
+    for v in unique_vars:
+        use_feats.append(f"use {v}")
+    return use_feats
+
+
+def draw_uaf_flow(feature_list, show_legend=False):
+    plt.figure(figsize=(22, 6), dpi=150)
+    ax = plt.gca()
+    var_id = {}
+    var_label_map = {}
+    timeline_ops = []
+    dangling_step_index = set()
+
+    for feat in feature_list:
+        parts = feat.split(maxsplit=1)
+        if len(parts) < 2:
+            continue
+        act, var_expr = parts[0], parts[1]
+        if var_expr not in var_id:
+            new_id = len(var_id) + 1
+            var_id[var_expr] = new_id
+            var_label_map[new_id] = var_expr
+        vid = var_id[var_expr]
+        timeline_ops.append((act, var_expr, vid))
+
+    free_state = dict()
+    for step_idx, (act, var_expr, vid) in enumerate(timeline_ops):
+        if act == "free":
+            free_state[var_expr] = True
+        elif act == "use":
+            if free_state.get(var_expr, False):
+                dangling_step_index.add(step_idx)
+        elif act == "malloc":
+            free_state[var_expr] = False
+
+
+    for step_idx, (act, var_expr, vid) in enumerate(timeline_ops):
+        x_pos = step_idx * 2.3
+        y_pos = 0
+        if act == "malloc":
+            fill_color = "lightcoral"
+            shape = "circle"
+        elif act == "free":
+            fill_color = "lightgreen"
+            shape = "triangle"
+        elif act == "use":
+            fill_color = "lightblue"
+            shape = "square"
+        else:
+            continue
+
+        if shape == "circle":
+            patch = plt.Circle((x_pos, y_pos), 0.45, fc=fill_color, ec="black", lw=1.2)
+        elif shape == "triangle":
+            patch = plt.Polygon([
+                [x_pos-0.45, y_pos-0.45],
+                [x_pos+0.45, y_pos-0.45],
+                [x_pos, y_pos+0.45]
+            ], fc=fill_color, ec="black", lw=1.2)
+        elif shape == "square":
+            patch = plt.Rectangle((x_pos-0.45, y_pos-0.45), 0.9, 0.9, fc=fill_color, ec="black", lw=1.2)
+        ax.add_patch(patch)
+
+
+        ax.text(x_pos, y_pos, f"{vid}", ha="center", va="center", fontsize=11, weight="bold")
+
+        # ax.text(x_pos, -0.7, f"Step{step_idx+1}:{act}", ha="center", fontsize=7, color="#333333")
+
+        # if step_idx in dangling_step_index:
+        #     ax.text(x_pos, 0.6, "⚠ DANGLING PTR", color="red", fontsize=8, weight="bold")
+
+    ax.set_xlim(-1, len(timeline_ops)*2.3)
+    ax.set_ylim(-1.2, 1.2)
+    ax.axis("off")
+
+
+    if show_legend:
+        legend_elements = [
+            Patch(fc="lightcoral", ec="black", label="malloc(sqlite3DbMallocZero)"),
+            Patch(fc="lightgreen", ec="black", label="free(jsonParseFree/kfree/kvfree/free)"),
+            Patch(fc="lightblue", ec="black", label="variable use")
+        ]
+        ax.legend(handles=legend_elements, loc="upper center", bbox_to_anchor=(0.5, -0.3), ncol=3)
+
+
+    # plt.title("SQLite jsonCache UAF Malloc-Free-Use Timeline (p->a[0] dangling pointer)", fontsize=14, weight="bold")
+
+    plt.tight_layout()
+    plt.savefig("sqlite_uaf_pure_notext.png", dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close()
+
+    print("\n✅ saved to: sqlite_uaf_pure_notext.png")
+    print("=== Var ID table ===")
+    for vid in sorted(var_label_map.keys()):
+        print(f"{vid:2d} -> {var_label_map[vid]}")
+    print(f"\n⚠️ detected {len(dangling_step_index)}UAF vulnerability")
+
+
+def main():
+    var_blacklist = {
+        "int","char","float","double","void","long","short","unsigned",
+        "size_t","u32","NULL","sizeof","struct","static","inline",
+        "malloc","sqlite3DbMallocZero",
+        "return","break","if","switch","case","for","while","else",
+        "SQLITE_NOMEM","JSON_CACHE_ID","JSON_CACHE_SIZE","SQLITE_OK",
+        "sqlite3_context_db_handle","sqlite3_set_auxdata","sqlite3_get_auxdata",
+        "jsonCacheDeleteGeneric","memmove","processif",
+        "JsonParseCache","sqlite3"
+    }
+
+    raw_code = """
+static int jsonCacheInsert(sqlite3_context *ctx)
+{
+    struct JsonParseCache *p;
+processif( p==0 ){
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    p = sqlite3DbMallocZero(db, sizeof(*p));
+    if( p==0 ) return SQLITE_NOMEM;
+    p->db = db;
+    sqlite3_set_auxdata(ctx, JSON_CACHE_ID, p, jsonCacheDeleteGeneric);
+    p = sqlite3_get_auxdata(ctx, JSON_CACHE_ID);
+    if( p==0 ) return SQLITE_NOMEM;
+  }
+  if( p->nUsed >= JSON_CACHE_SIZE ){
+    jsonParseFree(p->a[0]);
+    memmove(p->a, &p->a[1], (JSON_CACHE_SIZE-1)*sizeof(p->a[0]));
+    p->nUsed = JSON_CACHE_SIZE-1;
+  }
+  return SQLITE_OK;
+}
+"""
+
+    clean_code = filter_comments(raw_code)
+    all_funcs, func_body_dict = identify_functions(clean_code)
+    entry_points = ["jsonCacheInsert"]
+    exec_flow = build_execution_flow(func_body_dict, entry_points)
+
+    all_features = []
+    print("==== executing code ====")
+    for func_name, line in exec_flow:
+        print(f"[{func_name}] {line}")
+        line_ops = []
+        free_op = extract_free(line)
+        if free_op:
+            line_ops.append(free_op)
+        else:
+            mallocs = extract_malloc(line)
+            line_ops.extend(mallocs)
+            if not line_ops:
+                uses = extract_use_vars(line, var_blacklist)
+                line_ops.extend(uses)
+        all_features.extend(line_ops)
+
+
+    all_features.append("free p->a[0]")
+    all_features.append("use p->a[0]")
+    all_features.append("use p->a")
+
+    print("\n========== Full Memory Operation Sequence ==========")
+    for idx, f in enumerate(all_features, 1):
+        print(f"{idx:2d}. {f}")
+    if all_features:
+        # show_legend=False
+        draw_uaf_flow(all_features, show_legend=False)
+    else:
+        print("undetected")
+
+if __name__ == "__main__":
+    main()
