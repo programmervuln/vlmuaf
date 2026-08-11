@@ -1,0 +1,332 @@
+import re
+import matplotlib.pyplot as plt
+
+VAR_ID_MAP = {
+    "client_info": 1
+}
+
+
+def filter_comments(text):
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    return text
+
+
+def identify_functions(code):
+    funcs = []
+    pat = r'(void|int|char|float|double|struct|Image|ssize_t|MemoryInfo|JPEGClientInfo|StringInfo)\s*\*?\s*([A-Za-z_]\w*)\s*\([^)]*\)'
+    for m in re.finditer(pat, code):
+        func_name = m.group(2)
+        after_header_pos = m.end()
+        brace_start = code.find("{", after_header_pos)
+        if brace_start == -1:
+            continue
+        start_idx = brace_start + 1
+        funcs.append({"name": func_name, "start": start_idx})
+
+    func_body_map = {}
+    for f in funcs:
+        pos = f["start"]
+        brace = 1
+        while pos < len(code) and brace > 0:
+            if code[pos] == '{':
+                brace += 1
+            elif code[pos] == '}':
+                brace -= 1
+            pos += 1
+        body = code[f["start"]:pos-1]
+        func_body_map[f["name"]] = body
+    return funcs, func_body_map
+
+
+def build_execution_flow(func_body_map, entry_list):
+    exec_list = []
+    visited_func = set()
+
+    def dfs(func_name):
+        if func_name not in func_body_map or func_name in visited_func:
+            return
+        visited_func.add(func_name)
+        body = func_body_map[func_name]
+        lines = body.splitlines()
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            exec_list.append((func_name, line))
+            calls = set(re.findall(r"\b([A-Za-z_]\w+)\s*\(", line))
+
+            if "JPEGCleanup(" in line:
+                m = re.search(r'JPEGCleanup\s*\(\s*[^,]+,\s*([\w]+)\s*\)', line)
+                if m:
+                    free_var = m.group(1)
+                    exec_list.append(("[sim]JPEGCleanup", f"virtual_free {free_var}"))
+
+            for callee in calls:
+                if callee not in visited_func:
+                    dfs(callee)
+
+    for entry in entry_list:
+        dfs(entry)
+    return exec_list
+
+
+def extract_malloc(line):
+    pat = r"([A-Za-z_]\w+)\s*=\s*(?:\([^)]+\)\s*)?AcquireMagickMemory\s*\("
+    res = []
+    for m in re.findall(pat, line):
+        var = m
+        res.append(f"malloc {var}")
+    return res
+
+
+def extract_free(line):
+    virt_match = re.search(r'virtual_free\s+(\w+)', line)
+    if virt_match:
+        v_name = virt_match.group(1)
+        return f"free {v_name}"
+
+    pat = r"(RelinquishMagickMemory|DestroyStringInfo|free|kfree|kvfree)\s*\(\s*([\w>[\]]+)\s*\)"
+    match = re.search(pat, line)
+    if match:
+        v_name = match.group(2)
+        return f"free {v_name}"
+    return None
+
+
+def extract_use_vars(line):
+
+    use_feats = []
+    var_pat = r"\b([A-Za-z_]\w+(?:->|\.[A-Za-z_]\w+)*(?:\[\d*\])?)\b"
+    all_matches = re.findall(var_pat, line)
+    unique_vars = set()
+    for full_expr in all_matches:
+        base_var = re.split(r"->|\.", full_expr)[0]
+        if base_var in VAR_ID_MAP:
+            unique_vars.add(base_var)
+    for v in unique_vars:
+        use_feats.append(f"use {v}")
+    return use_feats
+
+
+def draw_uaf_flow(feature_list):
+    plt.figure(figsize=(16, 6))
+    pos_map = {}
+    shape_map = {}
+    text_map = {}
+    idx = 0
+
+    for feat in feature_list:
+        parts = feat.split()
+        if len(parts) < 2:
+            continue
+        act, var = parts[0], parts[1]
+        if var not in VAR_ID_MAP:
+            continue
+        if act == "malloc":
+            shape = "circle"
+        elif act == "free":
+            shape = "triangle"
+        elif act == "use":
+            shape = "square"
+        else:
+            continue
+        pos_map[idx] = (idx * 2, 0)
+        shape_map[idx] = shape
+        text_map[idx] = VAR_ID_MAP[var]
+        idx += 1
+
+    ax = plt.gca()
+    for i in range(len(pos_map)):
+        x, y = pos_map[i]
+        s = shape_map[i]
+        num = text_map[i]
+        if s == "circle":
+            circ = plt.Circle((x, y), 0.5, fc="lightcoral", ec="black")
+            ax.add_patch(circ)
+        elif s == "triangle":
+            poly = plt.Polygon(
+                [[x - 0.5, y - 0.5], [x + 0.5, y - 0.5], [x, y + 0.5]],
+                fc="lightgreen", ec="black"
+            )
+            ax.add_patch(poly)
+        elif s == "square":
+            rect = plt.Rectangle((x - 0.5, y - 0.5), 1, 1, fc="lightblue", ec="black")
+            ax.add_patch(rect)
+        plt.text(x, y, str(num), ha="center", va="center", fontsize=12)
+
+    plt.xlim(-1, len(pos_map) * 2)
+    plt.ylim(-1, 1)
+    plt.axis("off")
+    plt.title("ImageMagick ReadOneJPEGImage UAF: Memory Sequence (client_info=1)")
+    plt.tight_layout()
+    plt.savefig("imagemagick_uaf_same_style.png", dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close()
+    print("\n✅ saved to: imagemagick_uaf_same_style.png")
+
+
+def main():
+    raw_code = '''
+     client_info=(JPEGClientInfo *) RelinquishMagickMemory(client_info);
+    }
+  jpeg_destroy_decompress(jpeg_info);
+  return(client_info);
+}
+
+static void JPEGDestroyImageProfiles(JPEGClientInfo *client_info)
+{
+  ssize_t
+    i;
+
+  StringInfo
+    *profile;
+
+  for (i=0; i < MaxJPEGProfiles; i++)
+  {
+    profile=client_info->profiles[i];
+    if (profile == (StringInfo *) NULL)
+      continue;
+    client_info->profiles[i]=DestroyStringInfo(client_info->profiles[i]);
+  }
+}
+
+static Image *ReadOneJPEGImage(const ImageInfo *image_info,
+  struct jpeg_decompress_struct *jpeg_info,MagickOffsetType *offset,
+  ExceptionInfo *exception)
+{
+  char
+    value[MagickPathExtent];
+
+  const char
+    *dct_method,
+    *option;
+
+  Image
+    *image;
+
+  JPEGClientInfo
+    *client_info = (JPEGClientInfo *) NULL;
+
+  JSAMPLE
+    *volatile jpeg_pixels,
+    *p;
+
+  MagickBooleanType
+    status;
+
+  MagickSizeType
+    number_pixels;
+
+  MemoryInfo
+    *memory_info;
+
+  QuantumAny
+    range;
+
+  size_t
+    bytes_per_pixel,
+    max_memory_to_use;
+
+  ssize_t     i,    y;
+  struct jpeg_error_mgr
+    jpeg_error;
+  struct jpeg_progress_mgr
+    jpeg_progress;
+  image=AcquireImage(image_info,exception);
+  status=OpenBlob(image_info,image,ReadBinaryBlobMode,exception);
+  if (status == MagickFalse)
+    {
+      image=DestroyImageList(image);
+      return((Image *) NULL);
+    }
+  if (*offset != 0)
+    (void) SeekBlob(image,*offset,SEEK_SET);
+  if (GetBlobSize(image) < 107)
+    ThrowReaderException(CorruptImageError,"InsufficientImageDataInFile");
+  client_info=(JPEGClientInfo *) AcquireMagickMemory(sizeof(*client_info));
+  if (client_info == (JPEGClientInfo *) NULL)
+    ThrowReaderException(ResourceLimitError,"MemoryAllocationFailed");
+  (void) memset(client_info,0,sizeof(*client_info));
+  (void) memset(jpeg_info,0,sizeof(*jpeg_info));
+  (void) memset(&jpeg_error,0,sizeof(jpeg_error));
+  (void) memset(&jpeg_progress,0,sizeof(jpeg_progress));
+  jpeg_info->err=jpeg_std_error(&jpeg_error);
+  jpeg_info->err->emit_message=(void (*)(j_common_ptr,int)) JPEGWarningHandler;
+  jpeg_info->err->error_exit=(void (*)(j_common_ptr)) JPEGErrorHandler;
+  memory_info=(MemoryInfo *) NULL;
+  client_info->exception=exception;
+  client_info->image=image;
+  option=GetImageOption(image_info,"profile:skip");
+  client_info->skip_icc_profiles=IsOptionMember("ICC",option) != MagickFalse ?
+    MagickTrue : MagickFalse;
+  client_info->skip_app_profiles=IsOptionMember("APP",option) != MagickFalse ?
+    MagickTrue : MagickFalse;
+  client_info->detect_uhdr=IsStringFalse(GetImageOption(image_info,
+    "jpeg:detect-uhdr")) == MagickFalse ? MagickTrue : MagickFalse;
+  if (setjmp(client_info->error_recovery) != 0)
+    {
+      client_info=JPEGCleanup(jpeg_info,client_info);
+      (void) CloseBlob(image);
+      if (exception->severity < ErrorException)
+        return(GetFirstImageInList(image));
+      return(DestroyImage(image));
+    }
+  jpeg_info->client_data=(void *) client_info;'''
+
+    clean_code = filter_comments(raw_code)
+    all_funcs, func_body_dict = identify_functions(clean_code)
+    print(f"[DEBUG] Parsed functions: {list(func_body_dict.keys())}")
+
+    entry_points = ["ReadOneJPEGImage"]
+    exec_flow = build_execution_flow(func_body_dict, entry_points)
+
+    all_features = []
+    for func_name, line in exec_flow:
+        free_op = extract_free(line)
+        if free_op:
+            all_features.append(free_op)
+        else:
+            mallocs = extract_malloc(line)
+            all_features.extend(mallocs)
+            if not mallocs:
+                uses = extract_use_vars(line)
+                all_features.extend(uses)
+
+
+    filtered_features = []
+    prev = None
+    for feat in all_features:
+        if feat != prev:
+            filtered_features.append(feat)
+            prev = feat
+
+    print("\n=== Filtered Memory Timeline ===")
+    for idx, f in enumerate(filtered_features, 1):
+        print(f"{idx:2d}. {f}")
+
+
+    print("\n=== UAF Detection Result ===")
+    freed_vars = set()
+    uaf_found = False
+    for feat in filtered_features:
+        parts = feat.split()
+        if len(parts) < 2:
+            continue
+        act, var = parts[0], parts[1]
+        if act == "free":
+            freed_vars.add(var)
+        elif act == "use" and var in freed_vars:
+            print(f"⚠️  UAF DETECTED! Variable '{var}' (id={VAR_ID_MAP[var]}) used after being freed")
+            uaf_found = True
+    if not uaf_found:
+        print("✅ No UAF detected")
+
+    if filtered_features:
+        draw_uaf_flow(filtered_features)
+    else:
+        print("undetected")
+
+
+if __name__ == "__main__":
+    main()
