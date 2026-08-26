@@ -1,0 +1,324 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel, LongformerSelfAttention, LongformerConfig, LongformerModel
+from torchvision import transforms
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# 1. Mixture of Block Attention (MoBA) Module
+# Implements the sparse block attention described in Section III-D.
+# It processes a sequence of length L (here L=2) using multiple Longformer
+# self‑attention blocks and adaptively fuses their outputs.
+# -----------------------------------------------------------------------------
+class MoBA(nn.Module):
+    def __init__(self, embed_dim=768, num_heads=12, block_size=64, num_blocks=4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.block_size = block_size
+        self.num_blocks = num_blocks
+
+        # Multiple parallel LongformerSelfAttention blocks
+        self.block_attns = nn.ModuleList([
+            LongformerSelfAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                max_positional_embeddings=4096,
+                attention_window=block_size,
+                attention_dilation=1,
+                is_decoder=False
+            ) for _ in range(num_blocks)
+        ])
+
+        # Learnable mixture weights for combining block outputs
+        self.mixture_weights = nn.Parameter(torch.ones(num_blocks) / num_blocks)
+        self.output_proj = nn.Linear(embed_dim, embed_dim)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x, attention_mask=None):
+        """
+        x: [batch, seq_len, embed_dim]   (here seq_len = 2)
+        attention_mask: [batch, seq_len] (1 for valid, 0 for padding)
+        """
+        batch_size, seq_len, _ = x.shape
+        block_outputs = []
+
+        for attn in self.block_attns:
+            # LongformerSelfAttention expects attention_mask with shape [batch, seq_len]
+            out, _ = attn(x, attention_mask=attention_mask)
+            block_outputs.append(out)
+
+        # Normalise mixture weights and fuse
+        weights = torch.softmax(self.mixture_weights, dim=0)
+        mixed = sum(w * out for w, out in zip(weights, block_outputs))
+
+        # Residual connection + layer norm
+        out = self.layer_norm(x + self.output_proj(mixed))
+        return out
+
+
+# -----------------------------------------------------------------------------
+# 2. Longformer Text Encoder
+# Extracts a 768‑d pooled representation from a long code snippet (up to 4096 tokens).
+# -----------------------------------------------------------------------------
+class LongformerTextEncoder(nn.Module):
+    def __init__(self, embed_dim=768, max_seq_len=4096, num_heads=12, num_hidden_layers=6):
+        super().__init__()
+        config = LongformerConfig(
+            hidden_size=embed_dim,
+            num_attention_heads=num_heads,
+            num_hidden_layers=num_hidden_layers,
+            max_positional_embeddings=max_seq_len,
+            attention_window=64,
+            attention_dilation=1,
+            is_decoder=False,
+            pad_token_id=0
+        )
+        self.longformer = LongformerModel(config)
+        self.projection = nn.Linear(embed_dim, embed_dim)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, input_ids, attention_mask):
+        # input_ids: [batch, seq_len], attention_mask: [batch, seq_len]
+        outputs = self.longformer(input_ids=input_ids, attention_mask=attention_mask)
+        last_hidden = outputs.last_hidden_state  # [batch, seq_len, embed_dim]
+        pooled = last_hidden.mean(dim=1)         # [batch, embed_dim]
+        return self.layer_norm(self.projection(pooled))
+
+
+# -----------------------------------------------------------------------------
+# 3. Label Encoder (basic version: outputs 1‑d scalar)
+# -----------------------------------------------------------------------------
+class LabelEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, labels):
+        # labels: [batch] -> [batch, 1]
+        return labels.float().unsqueeze(1)
+
+
+# -----------------------------------------------------------------------------
+# 4. Dataset for UAF samples
+# Supports 4096‑token sequences.
+# -----------------------------------------------------------------------------
+class UAFDataset(Dataset):
+    def __init__(self, img_root, meta_root, genchange_root, is_train, preprocess, clip_processor, max_len=4096):
+        self.img_root = img_root
+        self.meta_root = meta_root
+        self.genchange_root = genchange_root
+        self.is_train = is_train
+        self.preprocess = preprocess
+        self.clip_processor = clip_processor
+        self.max_len = max_len
+
+        split_file = os.path.join(meta_root, 'train.txt' if is_train else 'val.txt')
+        if not os.path.exists(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
+
+        self.img_paths = []
+        self.code_paths = []
+        self.labels = []   # 0: UAF, 1: non‑UAF
+
+        with open(split_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) < 2:
+                    continue
+                img_name, flag = parts[0].strip(), parts[1].strip()
+                # Determine label based on naming convention
+                label = 0 if ('-0-' in img_name or flag == 'uaf') else 1
+                img_path = os.path.join(img_root, 'uaf' if label == 0 else 'not_uaf', img_name)
+                code_path = os.path.join(genchange_root, img_name.replace('.jpg', '.c'))
+
+                if os.path.exists(img_path) and os.path.exists(code_path):
+                    self.img_paths.append(img_path)
+                    self.code_paths.append(code_path)
+                    self.labels.append(label)
+
+        if len(self.img_paths) == 0:
+            raise ValueError("No valid samples found. Check your dataset paths.")
+        logger.info(f"Dataset loaded: {len(self)} samples (UAF={sum(1 for l in self.labels if l==0)})")
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        # Load image
+        img = Image.open(self.img_paths[idx]).convert('RGB')
+        img_tensor = self.preprocess(img)
+
+        # Load source code
+        with open(self.code_paths[idx], 'r', encoding='utf-8') as f:
+            code_text = f.read()
+
+        # Tokenize with CLIP processor (same tokenizer used for Longformer)
+        tokenized = self.clip_processor(
+            text=code_text,
+            max_length=self.max_len,
+            truncation=True,
+            padding='max_length',
+            return_tensors='pt'
+        )
+        input_ids = tokenized['input_ids'].squeeze(0)          # [max_len]
+        attention_mask = tokenized['attention_mask'].squeeze(0) # [max_len]
+
+        label = self.labels[idx]
+        return img_tensor, input_ids, attention_mask, label
+
+
+# -----------------------------------------------------------------------------
+# 5. Main UAFVLM model (paper architecture)
+# -----------------------------------------------------------------------------
+class UAFVLM(nn.Module):
+    def __init__(self, clip_model, embed_dim=768):
+        super().__init__()
+        self.clip_model = clip_model
+        self.label_encoder = LabelEncoder()
+        self.longformer_encoder = LongformerTextEncoder(embed_dim=embed_dim, max_seq_len=4096)
+        self.moba = MoBA(embed_dim=embed_dim, num_heads=12, block_size=64, num_blocks=4)
+
+        # Classifier input: FY(1) + FI(768) + FC_attn(768) = 1537
+        self.classifier = nn.Linear(1 + embed_dim + embed_dim, 2)
+
+        # Freeze CLIP base encoders (keep pretrained weights)
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+
+    def forward(self, image, input_ids, attention_mask, labels):
+        # 1. Visual feature FI (Eq. implicitly from CLIP image encoder)
+        FI = self.clip_model.get_image_features(pixel_values=image)   # [batch, 768]
+
+        # 2. Label feature FY (Eq.2)
+        FY = self.label_encoder(labels)                               # [batch, 1]
+
+        # 3. CLIP text feature FC_clip (Eq.3)
+        FC_clip = self.clip_model.get_text_features(input_ids=input_ids,
+                                                    attention_mask=attention_mask)  # [batch, 768]
+
+        # 4. Longformer text feature FC_longformer (Eq.4)
+        FC_longformer = self.longformer_encoder(input_ids, attention_mask)         # [batch, 768]
+
+        # 5. Combine the two text vectors into a sequence of length 2 (Eq.5)
+        #    [batch, 2, 768]
+        FC_combined_seq = torch.cat([FC_clip.unsqueeze(1), FC_longformer.unsqueeze(1)], dim=1)
+
+        # 6. Apply MoBA to enhance the sequence (Eq.6)
+        #    The attention mask for this 2‑token sequence is all ones.
+        batch_size = image.size(0)
+        seq_mask = torch.ones((batch_size, 2), device=image.device, dtype=torch.long)
+        FC_moba = self.moba(FC_combined_seq, attention_mask=seq_mask)  # [batch, 2, 768]
+
+        # 7. Average pooling to get FC_attn (Eq.7)
+        FC_attn = FC_moba.mean(dim=1)                                 # [batch, 768]
+
+        # 8. First fusion: FY + FI (Eq.8) -> [batch, 769]
+        F_concat1 = torch.cat([FY, FI], dim=1)
+
+        # 9. Second fusion: combine with FC_attn (Eq.9) -> [batch, 1537]
+        F_combined = torch.cat([F_concat1, FC_attn], dim=1)
+
+        # 10. Classification logits (Eq.10)
+        logits = self.classifier(F_combined)                         # [batch, 2]
+        return logits
+
+
+# -----------------------------------------------------------------------------
+# 6. Training loop
+# -----------------------------------------------------------------------------
+def train_model(model, dataloader, optimizer, criterion, device, epochs=10, save_dir='./models'):
+    os.makedirs(save_dir, exist_ok=True)
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        for batch_idx, (images, input_ids, masks, labels) in enumerate(dataloader):
+            images = images.to(device)
+            input_ids = input_ids.to(device)
+            masks = masks.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            logits = model(images, input_ids, masks, labels)
+            loss = criterion(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+            if (batch_idx + 1) % 10 == 0:
+                avg_loss = total_loss / (batch_idx + 1)
+                acc = correct / total
+                logger.info(f"Epoch {epoch+1}/{epochs} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {avg_loss:.4f} | Acc: {acc:.4f}")
+
+        epoch_loss = total_loss / len(dataloader)
+        epoch_acc = correct / total
+        logger.info(f"===== Epoch {epoch+1} finished | Avg Loss: {epoch_loss:.4f} | Acc: {epoch_acc:.4f} =====")
+
+        torch.save(model.state_dict(), os.path.join(save_dir, f'uafvlm_epoch_{epoch+1}.pth'))
+
+
+# -----------------------------------------------------------------------------
+# 7. Main script
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # ---------- Paths (adjust to your environment) ----------
+    img_root = '/zhangliqiang/clip/copyfolder/vlm0/pdg_data/images'
+    meta_root = '/zhangliqiang/clip/copyfolder/vlm0/pdg_data/meta'
+    genchange_root = '/zhangliqiang/clip/copyfolder/vlm0/genchangename'
+    save_dir = './uafvlm_models'
+
+    # ---------- Device ----------
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device}")
+
+    # ---------- Load CLIP ----------
+    try:
+        clip_model = CLIPModel.from_pretrained('/zhangliqiang/clip/copyfolder/vlm0/clip-model').to(device)
+        clip_processor = CLIPProcessor.from_pretrained('/zhangliqiang/clip/copyfolder/vlm0/clip-model')
+        logger.info("Loaded local CLIP model.")
+    except:
+        logger.warning("Local CLIP not found, downloading from HuggingFace...")
+        clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+        clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+    # ---------- Data preprocessing ----------
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                             std=[0.26862954, 0.26130258, 0.27577711])
+    ])
+
+    # ---------- Dataset & DataLoader ----------
+    train_dataset = UAFDataset(
+        img_root=img_root,
+        meta_root=meta_root,
+        genchange_root=genchange_root,
+        is_train=True,
+        preprocess=preprocess,
+        clip_processor=clip_processor,
+        max_len=4096
+    )
+    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=4, pin_memory=True)
+
+    # ---------- Model, loss, optimizer ----------
+    model = UAFVLM(clip_model=clip_model, embed_dim=768).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+
+    # ---------- Train ----------
+    train_model(model, train_loader, optimizer, criterion, device, epochs=10, save_dir=save_dir)
+    logger.info("Training finished.")
