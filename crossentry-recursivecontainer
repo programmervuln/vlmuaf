@@ -1,0 +1,269 @@
+import re
+import matplotlib.pyplot as plt
+
+# Global constant: variable‑id mapping
+VAR_ID_MAP = {
+    "item": 1,
+    "g_work_list": 2
+}
+
+# ===================== Preprocessing Utilities =====================
+def filter_comments(text):
+    """Remove single‑line and multi‑line comments"""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    return text
+
+
+def identify_functions(code):
+    """Extract function names, return types and function body start index"""
+    funcs = []
+    pat = r'(void|int|char|long|float|double|struct)\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{'
+    for m in re.finditer(pat, code):
+        func_name = m.group(2)
+        start_idx = m.end()
+        funcs.append({
+            "name": func_name,
+            "start": start_idx
+        })
+    func_body_map = {}
+    for f in funcs:
+        pos = f["start"]
+        brace = 1
+        while pos < len(code) and brace > 0:
+            if code[pos] == '{':
+                brace += 1
+            elif code[pos] == '}':
+                brace -= 1
+            pos += 1
+        body = code[f["start"]:pos - 1]
+        func_body_map[f["name"]] = body
+    return funcs, func_body_map
+
+
+# ===================== Build execution flow: support multiple disjoint top‑level entries =====================
+def build_execution_flow(func_body_map, entry_list, pointer_map=None):
+    if pointer_map is None:
+        pointer_map = {}
+    exec_list = []
+    visited_func = set()
+
+    def dfs(func_name):
+        if func_name not in func_body_map or func_name in visited_func:
+            return
+        visited_func.add(func_name)
+        body = func_body_map[func_name]
+        lines = body.splitlines()
+        for _, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            exec_list.append((func_name, line))
+            calls = set()
+            for m in re.finditer(r"\b([A-Za-z_]\w+)\s*\(", line):
+                calls.add(m.group(1))
+            for m in re.finditer(r"(?:->|\.)([A-Za-z_]\w+)\s*\(", line):
+                calls.add(m.group(1))
+            for callee in calls:
+                dfs(callee)
+                if callee in pointer_map:
+                    real_func = pointer_map[callee]
+                    dfs(real_func)
+
+    for entry in entry_list:
+        visited_func.clear()
+        dfs(entry)
+    return exec_list
+
+
+# ===================== Memory operation parsing for linked‑list example =====================
+def extract_malloc(line):
+    res = []
+    pat = r"([A-Za-z_]\w+)\s*=\s*\(.*?\)?(malloc|kvmalloc|kmalloc)\s*\("
+    for m in re.findall(pat, line):
+        var = m[0]
+        res.append(f"malloc {var}")
+    return res
+
+
+def extract_free(line):
+    """Parse kfree(var) statements"""
+    pat = r"(kfree|kvfree|free)\s*\(\s*([A-Za-z_]\w+)\s*\)"
+    match = re.search(pat, line)
+    if match:
+        free_var = match.group(2)
+        return f"free {free_var}"
+    return None
+
+
+def extract_list_iter_var(line):
+    """Parse list_for_each_entry(iter_var, ...), mark as use"""
+    pat = r"list_for_each_entry\s*\(\s*([A-Za-z_]\w+)\s*,"
+    m = re.search(pat, line)
+    if m:
+        iter_var = m.group(1)
+        return f"use {iter_var}"
+    return None
+
+
+def extract_struct_access_use(line, blacklist, func_names):
+    """Parse struct member access like ptr->member, mark base pointer as use"""
+    use_feats = []
+    line_clean = re.sub(r"\b(kfree|kvfree|free)\s*\([^)]*\)\s*;?", "", line)
+    pat = r"\b([A-Za-z_]\w+)>[A-Za-z_]\w+"
+    matches = re.findall(pat, line_clean)
+    unique_vars = set()
+    for base_var in matches:
+        if (base_var in blacklist or base_var in func_names):
+            continue
+        unique_vars.add(base_var)
+    for v in unique_vars:
+        use_feats.append(f"use {v}")
+    return use_feats
+
+
+# ===================== Drawing module: only circle / triangle / square =====================
+def draw_uaf_flow(feature_list):
+    plt.figure(figsize=(16, 6))
+    pos_map = {}
+    shape_map = {}
+    text_map = {}
+    idx = 0
+    for feat in feature_list:
+        parts = feat.split()
+        if len(parts) < 2:
+            continue
+        act, var = parts[0], parts[1]
+        if var not in VAR_ID_MAP:
+            continue
+        if act == "malloc":
+            shape = "circle"
+        elif act == "free":
+            shape = "triangle"
+        elif act == "use":
+            shape = "square"
+        else:
+            continue
+        pos_map[idx] = (idx * 2, 0)
+        shape_map[idx] = shape
+        text_map[idx] = VAR_ID_MAP[var]
+        idx += 1
+    ax = plt.gca()
+    for i in range(len(pos_map)):
+        x, y = pos_map[i]
+        s = shape_map[i]
+        num = text_map[i]
+        if s == "circle":
+            circ = plt.Circle((x, y), 0.5, fc="lightcoral", ec="black")
+            ax.add_patch(circ)
+        elif s == "triangle":
+            poly = plt.Polygon([[x-0.5, y-0.5], [x+0.5, y-0.5], [x, y+0.5]], fc="lightgreen", ec="black")
+            ax.add_patch(poly)
+        elif s == "square":
+            rect = plt.Rectangle((x-0.5, y-0.5), 1, 1, fc="lightblue", ec="black")
+            ax.add_patch(rect)
+        plt.text(x, y, str(num), ha="center", va="center", fontsize=12)
+    plt.xlim(-1, len(pos_map) * 2)
+    plt.ylim(-1.2, 1.2)
+    plt.axis("off")
+    plt.title("Recursive‑Container Cross‑Entry UAF Flow (item=1, g_work_list=2)")
+    plt.show()
+
+
+# ===================== Main entry =====================
+def main():
+    test_code = r"""
+#include <linux/list.h>
+#include <linux/slab.h>
+
+static struct list_head g_work_list;
+
+struct work_item {
+    int work_id;
+    char name[32];
+    struct list_head list;
+};
+
+long ioctl_delete_work(unsigned int work_id)
+{
+    struct work_item *item;
+
+    list_for_each_entry(item, &g_work_list, list) {
+        if (item->work_id == work_id) {
+            kfree(item);
+            return 0;
+        }
+    }
+    return -ENOENT;
+}
+
+long ioctl_show_work(void)
+{
+    struct work_item *item;
+
+    list_for_each_entry(item, &g_work_list, list) {
+        pr_info("work: id=%d name=%s\n", item->work_id, item->name);
+    }
+    return 0;
+}
+"""
+
+    blacklist = {
+        "int", "char", "long", "unsigned", "void", "static",
+        "sizeof", "NULL", "kfree", "kmalloc", "kvfree", "free",
+        "struct", "return", "break", "if", "for", "while", "else"
+    }
+
+    raw_code = test_code
+    clean_code = filter_comments(raw_code)
+    all_funcs, func_body_dict = identify_functions(clean_code)
+    func_names = {f["name"] for f in all_funcs}
+
+    pointer_dispatch = {}
+    entry_points = ["ioctl_delete_work", "ioctl_show_work"]
+    exec_flow = build_execution_flow(func_body_dict, entry_points, pointer_dispatch)
+
+    all_features = []
+    print("========== Execution Flow ==========")
+    for func_name, line in exec_flow:
+        print(f"[{func_name}] {line}")
+        mallocs = extract_malloc(line)
+        all_features.extend(mallocs)
+
+        free_feat = extract_free(line)
+        if free_feat:
+            all_features.append(free_feat)
+
+        list_iter_feat = extract_list_iter_var(line)
+        if list_iter_feat:
+            all_features.append(list_iter_feat)
+
+        uses = extract_struct_access_use(line, blacklist, func_names)
+        all_features.extend(uses)
+
+    print("\n========== Clean Memory Operation Sequence ==========")
+    for f in all_features:
+        print(f)
+
+    print("\n========== UAF Detection Result ==========")
+    freed_vars = set()
+    uaf_found = False
+    for feat in all_features:
+        parts = feat.split()
+        if len(parts) < 2:
+            continue
+        act, var = parts[0], parts[1]
+        if act == "free":
+            freed_vars.add(var)
+        elif act == "use" and var in freed_vars:
+            print(f"⚠️  UAF DETECTED! Variable '{var}' (id={VAR_ID_MAP[var]}) used after being freed")
+            uaf_found = True
+
+    if not uaf_found:
+        print("✅ No UAF detected")
+
+    draw_uaf_flow(all_features)
+
+
+if __name__ == "__main__":
+    main()
